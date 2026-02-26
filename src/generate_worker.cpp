@@ -103,35 +103,38 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         return;
     }
 
-    // Build sampler chain (order mirrors llama.cpp's common_sampler)
+    // Build sampler chain.
+    // Grammar must come FIRST so it zeros out non-grammatical tokens from the
+    // full logit distribution before top-k/top-p/min-p can discard them.
+    // Order mirrors llama.cpp's common_sampler "grammar_first" path.
     llama_sampler * smpl =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
 
-    // 1. Repeat penalty
+    // 1. Grammar — constrain logits before any probability filtering
+    if (!grammar_str_.empty()) {
+        llama_sampler_chain_add(smpl,
+            llama_sampler_init_grammar(vocab_, grammar_str_.c_str(), "root"));
+    }
+    // 2. Repeat penalty
     if (repeat_penalty_ != 1.0f && repeat_last_n_ != 0) {
         llama_sampler_chain_add(smpl,
             llama_sampler_init_penalties(repeat_last_n_, repeat_penalty_,
                                          0.0f, 0.0f));
     }
-    // 2. Top-k
+    // 3. Top-k
     if (top_k_ > 0) {
         llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k_));
     }
-    // 3. Top-p
+    // 4. Top-p
     if (top_p_ < 1.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p_, 1));
     }
-    // 4. Min-p
+    // 5. Min-p
     if (min_p_ > 0.0f) {
         llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p_, 1));
     }
-    // 5. Temperature
+    // 6. Temperature
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature_));
-    // 6. Grammar (constrain the distribution before final sampling)
-    if (!grammar_str_.empty()) {
-        llama_sampler_chain_add(smpl,
-            llama_sampler_init_grammar(vocab_, grammar_str_.c_str(), "root"));
-    }
     // 7. Final stochastic sampler
     llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
 
