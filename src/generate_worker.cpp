@@ -159,7 +159,13 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
             return;
         }
 
-        new_token_id = llama_sampler_sample(smpl, ctx_, -1);
+        try {
+            new_token_id = llama_sampler_sample(smpl, ctx_, -1);
+        } catch (const std::runtime_error &) {
+            // Grammar fully satisfied — stacks are empty, no further tokens
+            // can be accepted. Treat as a clean end-of-generation.
+            break;
+        }
 
         if (llama_vocab_is_eog(vocab_, new_token_id)) {
             break;
