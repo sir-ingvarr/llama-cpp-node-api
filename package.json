@@ -1,0 +1,47 @@
+{
+    "name": "llama-node",
+    "version": "0.1.0",
+    "description": "Node.js native addon for llama.cpp — direct in-process inference",
+    "main": "js/index.js",
+    "types": "js/index.d.ts",
+    "repository": "https://github.com/sir-ingvarr/node-llama-cpp",
+    "license": "MIT",
+    "keywords": [
+        "llama",
+        "llm",
+        "inference",
+        "native-addon",
+        "gguf",
+        "electron"
+    ],
+    "engines": {
+        "node": ">=18"
+    },
+    "scripts": {
+        "install": "cmake-js compile",
+        "build": "cmake-js compile",
+        "build:debug": "cmake-js compile --debug",
+        "build:cuda": "cmake-js compile -- -DGGML_CUDA=ON",
+        "build:cpu": "cmake-js compile -- -DGGML_METAL=OFF",
+        "build:root": "cmake-js rebuild",
+        "rebuild": "cmake-js rebuild"
+    },
+    "cmake-js": {
+        "runtime": "electron",
+        "runtimeVersion": "35.0.0"
+    },
+    "binary": {
+        "module_name": "llama_node",
+        "module_path": "build/Release"
+    },
+    "files": [
+        "js/",
+        "src/",
+        "CMakeLists.txt",
+        "package.json"
+    ],
+    "devDependencies": {
+        "cmake-js": "^7.3.0",
+        "node-addon-api": "^8.3.0"
+    }
+}

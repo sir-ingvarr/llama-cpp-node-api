@@ -1,0 +1,19 @@
+# Build output
+build/
+
+# npm
+node_modules/
+
+# llama.cpp vendored submodule build artifacts
+vendor/llama.cpp/build/
+
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# macOS
+.DS_Store
+
+# Prebuilt binaries (consumers compile from source)
+*.node
