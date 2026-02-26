@@ -28,7 +28,8 @@
     },
     "cmake-js": {
         "runtime": "electron",
-        "runtimeVersion": "35.0.0"
+        "runtimeVersion": "35.0.0",
+        "silent": false
     },
     "binary": {
         "module_name": "llama_node",

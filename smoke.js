@@ -2,7 +2,7 @@
 
 const { LlamaModel, LlamaModelPool } = require('./js/index.js');
 
-const MODEL_PATH = process.argv[2] || '/Users/igorberezin/AI/models/llm/llama-3.1-8B-uncensored.gguf';
+const MODEL_PATH = process.argv[2];
 
 // Llama 3 instruct template
 const userPrompt = (text) =>
