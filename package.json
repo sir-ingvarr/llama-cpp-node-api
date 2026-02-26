@@ -38,10 +38,11 @@
     "files": [
         "js/",
         "src/",
+        "vendor/",
         "CMakeLists.txt",
         "package.json"
     ],
-    "devDependencies": {
+    "dependencies": {
         "cmake-js": "^7.3.0",
         "node-addon-api": "^8.3.0"
     }
