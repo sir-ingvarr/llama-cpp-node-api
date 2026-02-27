@@ -3,50 +3,75 @@
 const fs   = require('fs');
 const path = require('path');
 
-// Resolve the native addon from the build output directory.
-// cmake-js places it at build/Release/llama_node.node by default.
-const addonPath = path.resolve(__dirname, '..', 'build', 'Release', 'llama_node.node');
-const addon = require(addonPath);
+const addon = require(path.resolve(__dirname, '..', 'build', 'Release', 'llama_node.node'));
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
 
 /**
- * High-level wrapper around the native LlamaModel addon class.
- *
- * Turns the raw callback-based generate() into an async generator so callers
- * can use `for await (const token of model.generate(prompt))`.
+ * Push/pull channel that bridges the native callback producer to an async
+ * iterator. Keeps a micro-queue so tokens produced before the consumer calls
+ * next() are never dropped.
  */
+function createChannel() {
+    const queue  = [];
+    let waiter   = null;
+    let closed   = false;
+    let closeErr = null;
+
+    function wake(item) {
+        if (waiter) { const w = waiter; waiter = null; w(item); }
+        else         queue.push(item);
+    }
+
+    return {
+        push(value)  { wake({ value, done: false }); },
+        close(err)   { closeErr = err ?? null; closed = true; wake({ done: true }); },
+        get error()  { return closeErr; },
+        [Symbol.asyncIterator]() {
+            return {
+                next() {
+                    if (queue.length) return Promise.resolve(queue.shift());
+                    if (closed)       return Promise.resolve({ done: true });
+                    return new Promise(r => { waiter = r; });
+                }
+            };
+        }
+    };
+}
+
+/**
+ * If opts.grammarFile is set, reads it and injects its contents as opts.grammar.
+ */
+function resolveGrammar(opts) {
+    if (!opts.grammarFile) return opts;
+    const { grammarFile, ...rest } = opts;
+    return { ...rest, grammar: fs.readFileSync(grammarFile, 'utf8') };
+}
+
+// ---------------------------------------------------------------------------
+// LlamaModel
+// ---------------------------------------------------------------------------
+
 class LlamaModel {
-    /** @type {object} */
     #native;
     #generating = false;
 
     /**
-     * @param {string} modelPath   Absolute path to the .gguf model file.
-     * @param {object} [opts]
-     * @param {number} [opts.nGpuLayers=99]   GPU layers to offload.
-     * @param {number} [opts.nCtx=2048]        Context size (tokens).
+     * @param {string} modelPath  Absolute path to the .gguf model file.
+     * @param {{ nGpuLayers?: number, nCtx?: number }} [opts]
      */
     constructor(modelPath, opts = {}) {
         this.#native = new addon.LlamaModel(modelPath, opts);
     }
 
     /**
-     * Generate tokens for a given prompt as an async iterable.
+     * Yields token strings as they are produced.
      *
      * @param {string} prompt
-     * @param {object} [opts]
-     * @param {number}   [opts.nPredict=256]
-     * @param {number}   [opts.temperature=0.8]
-     * @param {number}   [opts.topP=0.95]
-     * @param {number}   [opts.topK=40]
-     * @param {number}   [opts.minP=0]
-     * @param {number}   [opts.repeatPenalty=1.0]
-     * @param {number}   [opts.repeatLastN=64]
-     * @param {string}   [opts.grammar]         GBNF grammar string.
-     * @param {string}   [opts.grammarFile]      Path to a .gbnf file (read and passed as grammar).
-     * @param {string[]} [opts.stop]             Stop sequences — generation halts when any is produced.
-     * @param {number}   [opts.nCtx]
-     * @param {boolean}  [opts.resetContext=false]
-     * @yields {string} Token text pieces as they are produced.
+     * @param {import('./index').GenerateOptions} [opts]
+     * @yields {string}
      */
     async * generate(prompt, opts = {}) {
         if (this.#generating) {
@@ -54,147 +79,73 @@ class LlamaModel {
         }
         this.#generating = true;
 
-        // Resolve grammarFile → grammar string before entering the native layer.
-        let nativeOpts = opts;
-        if (opts.grammarFile) {
-            const grammarStr = fs.readFileSync(opts.grammarFile, 'utf8');
-            nativeOpts = { ...opts, grammar: grammarStr };
-            delete nativeOpts.grammarFile;
-        }
-
-        // A small queue + promise bridge so tokens produced by the native
-        // onToken callback are surfaced as async-generator yields.
-        /** @type {Array<{value:string,done:false}|{done:true}>} */
-        const queue = [];
-        /** @type {((item:any)=>void)|null} */
-        let resolve = null;
-        let done = false;
-        /** @type {Error|null} */
-        let error = null;
-
-        const enqueue = (item) => {
-            if (resolve) {
-                const r = resolve;
-                resolve = null;
-                r(item);
-            } else {
-                queue.push(item);
-            }
-        };
-
+        const ch = createChannel();
         this.#native.generate(
             prompt,
-            nativeOpts,
-            (token) => {
-                enqueue({ value: token, done: false });
-            },
-            (err) => {
-                done = true;
-                error = err || null;
-                enqueue({ done: true });
-            }
+            resolveGrammar(opts),
+            buf => ch.push(buf.toString('utf8')),
+            err => ch.close(err)
         );
 
         try {
-            while (true) {
-                let item;
-                if (queue.length > 0) {
-                    item = queue.shift();
-                } else if (done) {
-                    break;
-                } else {
-                    item = await new Promise((r) => { resolve = r; });
-                }
-
-                if (item.done) {
-                    break;
-                }
-                yield item.value;
-            }
+            for await (const token of ch) yield token;
         } finally {
             this.#generating = false;
         }
 
-        if (error) {
-            throw error;
-        }
+        if (ch.error) throw ch.error;
     }
 
     /** Signal the running generation to stop at the next token boundary. */
-    abort() {
-        this.#native.abort();
-    }
+    abort() { this.#native.abort(); }
 
-    /**
-     * Release native resources (model weights + KV cache).
-     * No methods should be called on this instance after dispose().
-     */
-    dispose() {
-        this.#native.dispose();
-    }
+    /** Release model weights and KV cache. */
+    dispose() { this.#native.dispose(); }
 
-    /** Number of context tokens available in the current context window. */
-    get contextLength() {
-        return this.#native.contextLength;
-    }
+    /** Number of token slots in the current context window. */
+    get contextLength() { return this.#native.contextLength; }
 
-    /** Support `using model = new LlamaModel(...)` (TC39 explicit resource management). */
-    [Symbol.dispose]() {
-        this.dispose();
-    }
+    [Symbol.dispose]() { this.dispose(); }
 }
 
-/**
- * Manages a named set of LlamaModel instances, loading each lazily on first use.
- *
- * Solves the multi-model routing problem: instead of manually tracking multiple
- * LlamaModel instances and disposing/reloading them, register all models up
- * front and call generate() by name.
- *
- * @example
- * const pool = new LlamaModelPool();
- * pool.register('fast', '/models/phi-3-mini.gguf', { nGpuLayers: 99 });
- * pool.register('smart', '/models/llama-3-70b.gguf', { nGpuLayers: 99 });
- *
- * for await (const t of pool.generate('fast', prompt)) process.stdout.write(t);
- * pool.dispose();
- */
+// ---------------------------------------------------------------------------
+// LlamaModelPool
+// ---------------------------------------------------------------------------
+
 class LlamaModelPool {
     /** @type {Map<string, { modelPath: string, modelOpts: object, instance: LlamaModel|null }>} */
     #registry = new Map();
 
     /**
      * Register a model under a name. Does not load it yet.
-     * @param {string} name       Unique name for this model.
-     * @param {string} modelPath  Absolute path to the .gguf file.
-     * @param {object} [opts]     LlamaModelOptions (nGpuLayers, nCtx).
+     * @param {string} name
+     * @param {string} modelPath
+     * @param {{ nGpuLayers?: number, nCtx?: number }} [opts]
      */
     register(name, modelPath, opts = {}) {
         if (this.#registry.has(name)) {
-            throw new Error(`LlamaModelPool: model '${name}' is already registered`);
+            throw new Error(`LlamaModelPool: '${name}' is already registered`);
         }
         this.#registry.set(name, { modelPath, modelOpts: opts, instance: null });
     }
 
     /**
-     * Returns the live LlamaModel for the given name, loading it if not yet loaded.
+     * Returns the live model for the given name, loading it if needed.
      * @param {string} name
      * @returns {LlamaModel}
      */
     load(name) {
         const entry = this.#registry.get(name);
         if (!entry) throw new Error(`LlamaModelPool: unknown model '${name}'`);
-        if (!entry.instance) {
-            entry.instance = new LlamaModel(entry.modelPath, entry.modelOpts);
-        }
+        entry.instance ??= new LlamaModel(entry.modelPath, entry.modelOpts);
         return entry.instance;
     }
 
     /**
      * Generate from a named model.
-     * @param {string} name    Registered model name.
+     * @param {string} name
      * @param {string} prompt
-     * @param {object} [opts]  GenerateOptions.
+     * @param {import('./index').GenerateOptions} [opts]
      * @yields {string}
      */
     async * generate(name, prompt, opts = {}) {
@@ -202,34 +153,29 @@ class LlamaModelPool {
     }
 
     /**
-     * Unload a single model and free its native resources.
-     * The registration is kept so the model can be loaded again on next use.
+     * Unload a single model, freeing its native resources.
+     * The registration is kept; the model reloads automatically on next use.
      * @param {string} name
      */
     unload(name) {
         const entry = this.#registry.get(name);
         if (!entry) throw new Error(`LlamaModelPool: unknown model '${name}'`);
-        if (entry.instance) {
-            entry.instance.dispose();
-            entry.instance = null;
-        }
+        entry.instance?.dispose();
+        entry.instance = null;
+        this.#registry.delete(name);
     }
 
     /** Dispose all loaded models and clear the registry. */
     dispose() {
-        for (const [, entry] of this.#registry) {
-            if (entry.instance) {
-                entry.instance.dispose();
-                entry.instance = null;
-            }
+        for (const entry of this.#registry.values()) {
+            entry.instance?.dispose();
         }
         this.#registry.clear();
     }
 
-    /** Explicit resource management support. */
-    [Symbol.dispose]() {
-        this.dispose();
-    }
+    [Symbol.dispose]() { this.dispose(); }
 }
+
+// ---------------------------------------------------------------------------
 
 module.exports = { LlamaModel, LlamaModelPool };

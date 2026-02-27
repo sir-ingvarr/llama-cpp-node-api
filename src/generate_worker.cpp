@@ -4,6 +4,28 @@
 #include <cstring>
 #include <stdexcept>
 
+// Returns the index past the last *complete* UTF-8 sequence in s.
+// Bytes in [result, s.size()) form an incomplete trailing sequence and
+// must be carried to the next chunk.
+static size_t complete_utf8_boundary(const std::string & s) {
+    size_t n = s.size();
+    if (n == 0) return 0;
+    size_t i = n;
+    while (i > 0) {
+        unsigned char c = (unsigned char)s[--i];
+        if ((c & 0x80) == 0)        return n;          // ASCII — complete
+        if ((c & 0xC0) == 0x80)     continue;          // continuation byte
+        // Leading byte: determine expected total length
+        size_t expected;
+        if      ((c & 0xE0) == 0xC0) expected = 2;
+        else if ((c & 0xF0) == 0xE0) expected = 3;
+        else if ((c & 0xF8) == 0xF0) expected = 4;
+        else                          return n;         // invalid — emit as-is
+        return (n - i >= expected) ? n : i;
+    }
+    return 0;
+}
+
 GenerateWorker::GenerateWorker(
     Napi::Function &         token_cb,
     Napi::Function &         done_cb,
@@ -147,6 +169,22 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // but not yet forwarded to JS; they are flushed once we know they are
     // not the beginning of a stop sequence.
     std::string pending;
+    std::string utf8_carry;   // incomplete multi-byte sequence from previous chunk
+
+    auto emit = [&](std::string text) {
+        std::string full = utf8_carry + std::move(text);
+        utf8_carry.clear();
+        size_t boundary = complete_utf8_boundary(full);
+        if (boundary < full.size()) {
+            utf8_carry = full.substr(boundary);
+            full.resize(boundary);
+        }
+        if (!full.empty()) {
+            TokenChunk ch;
+            ch.text = std::move(full);
+            progress.Send(&ch, 1);
+        }
+    };
 
     while (true) {
         if (cancel_.load(std::memory_order_relaxed)) {
@@ -194,9 +232,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
                     if (pending.compare(off, stop.size(), stop) == 0) {
                         // Flush everything before the stop sequence, then halt.
                         if (off > 0) {
-                            TokenChunk ch;
-                            ch.text = pending.substr(0, off);
-                            progress.Send(&ch, 1);
+                            emit(pending.substr(0, off));
                         }
                         pending.clear();
                         stopped = true;
@@ -210,17 +246,13 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
             size_t hold = trailing_stop_prefix(pending, stop_sequences_);
             size_t safe  = pending.size() - hold;
             if (safe > 0) {
-                TokenChunk ch;
-                ch.text = pending.substr(0, safe);
-                progress.Send(&ch, 1);
+                emit(pending.substr(0, safe));
                 pending.erase(0, safe);
             }
         } else {
             // No stop sequences — emit immediately.
-            TokenChunk chunk;
-            chunk.text = std::move(pending);
+            emit(std::move(pending));
             pending.clear();
-            progress.Send(&chunk, 1);
         }
 
         batch = llama_batch_get_one(&new_token_id, 1);
@@ -233,8 +265,12 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
 
     // Flush any text held back for stop-sequence lookahead that never matched.
     if (!pending.empty()) {
+        emit(std::move(pending));
+    }
+    // Flush any incomplete UTF-8 sequence carried from the last chunk.
+    if (!utf8_carry.empty()) {
         TokenChunk ch;
-        ch.text = std::move(pending);
+        ch.text = std::move(utf8_carry);
         progress.Send(&ch, 1);
     }
 
@@ -245,7 +281,8 @@ void GenerateWorker::OnProgress(const TokenChunk * chunks, size_t count) {
     Napi::Env env = token_cb_.Env();
     Napi::HandleScope scope(env);
     for (size_t i = 0; i < count; ++i) {
-        token_cb_.Call({Napi::String::New(env, chunks[i].text)});
+        const std::string & text = chunks[i].text;
+        token_cb_.Call({Napi::Buffer<char>::Copy(env, text.data(), text.size())});
     }
 }
 

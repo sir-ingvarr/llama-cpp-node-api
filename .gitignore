@@ -17,3 +17,5 @@ vendor/llama.cpp/build/
 
 # Prebuilt binaries (consumers compile from source)
 *.node
+
+.cache
