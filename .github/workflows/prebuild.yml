@@ -1,0 +1,98 @@
+name: Prebuild & Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            platform: darwin
+            arch: arm64
+          - os: macos-latest-large
+            platform: darwin
+            arch: x64
+          - os: ubuntu-latest
+            platform: linux
+            arch: x64
+          - os: windows-latest
+            platform: win32
+            arch: x64
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies (skip native build)
+        run: npm install --ignore-scripts
+
+      - name: Build native module
+        run: npx cmake-js compile --release -r node
+
+      - name: Package prebuild
+        shell: bash
+        run: |
+          PACKAGE_NAME=$(node -p "require('./package.json').name")
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          NODE_FILE=$(find build -name "llama_node.node" -type f | head -1)
+          if [ -z "$NODE_FILE" ]; then
+            echo "::error::Could not find llama_node.node"
+            exit 1
+          fi
+          mkdir -p staging/build/Release
+          cp "$NODE_FILE" staging/build/Release/llama_node.node
+          TARBALL="${PACKAGE_NAME}-v${PACKAGE_VERSION}-napi-v8-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz"
+          tar -czf "${TARBALL}" -C staging build/Release/llama_node.node
+          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
+
+      - name: Upload to release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: ${{ env.TARBALL }}
+          draft: false
+
+  smoke-test:
+    needs: build
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+          - os: macos-latest-large
+          - os: ubuntu-latest
+          - os: windows-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          submodules: false
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 18
+
+      - name: Install dependencies (skip native build)
+        run: npm install --ignore-scripts
+
+      - name: Download prebuild (should not compile)
+        run: npx prebuild-install -r napi --verbose -T ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Verify native module loads
+        run: node -e "require('./build/Release/llama_node.node')"

@@ -1,0 +1,7 @@
+build/
+test/
+smoke.js
+.github/
+.DS_Store
+*.node
+prebuilds/
