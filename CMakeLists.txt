@@ -64,6 +64,9 @@ if(LLAMA_NODE_VENDOR)
     set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
+    # Static libs must be built with -fPIC on Linux so they can be linked
+    # into the shared .node addon.
+    set(CMAKE_POSITION_INDEPENDENT_CODE ON CACHE BOOL "" FORCE)
     # Disable host-native CPU flags: cmake-js may cross-compile (e.g. x86_64
     # host → arm64 target via CMAKE_OSX_ARCHITECTURES), so -mcpu=native is
     # invalid. Metal covers GPU acceleration; generic ARM code is fine.
