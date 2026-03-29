@@ -53,9 +53,24 @@ export interface GenerateOptions {
     resetContext?: boolean;
 }
 
+export interface ChatMessage {
+    role: string;
+    content: string;
+}
+
+export interface ApplyChatTemplateOptions {
+    /** Whether to append the assistant turn prefix. Default: true. */
+    addAssistant?: boolean;
+}
+
 export declare class LlamaModel {
     constructor(modelPath: string, opts?: LlamaModelOptions);
     generate(prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, undefined>;
+    /**
+     * Format messages using the model's built-in chat template.
+     * Uses llama.cpp's built-in template renderer (not a full Jinja parser).
+     */
+    applyChatTemplate(messages: ChatMessage[], opts?: ApplyChatTemplateOptions): string;
     abort(): void;
     dispose(): void;
     readonly contextLength: number;
@@ -91,6 +106,8 @@ export declare class LlamaModelPool {
 
     /** Dispose all loaded models and clear the registry. */
     dispose(): void;
+
+    get chatTemplate(): string | null;
 
     [Symbol.dispose](): void;
 }

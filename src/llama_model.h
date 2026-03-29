@@ -21,6 +21,7 @@ private:
     void Dispose(const Napi::CallbackInfo & info);
     Napi::Value ContextLength(const Napi::CallbackInfo & info);
     Napi::Value ChatTemplate(const Napi::CallbackInfo & info);
+    Napi::Value ApplyChatTemplate(const Napi::CallbackInfo & info);
 
     // Internal helpers
     bool EnsureContext(uint32_t n_ctx, std::string & error_out);

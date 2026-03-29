@@ -16,6 +16,7 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod<&LlamaModel::Dispose>("dispose"),
         InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
         InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
+        InstanceMethod<&LlamaModel::ApplyChatTemplate>("applyChatTemplate"),
     });
 
     Napi::FunctionReference * ctor = new Napi::FunctionReference();
@@ -324,4 +325,74 @@ Napi::Value LlamaModel::ChatTemplate(const Napi::CallbackInfo & info) {
         return env.Null();
     }
     return Napi::String::New(env, tmpl);
+}
+
+// ---------------------------------------------------------------------------
+// applyChatTemplate(messages, opts?)
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::ApplyChatTemplate(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env,
+            "applyChatTemplate(messages: Array<{role, content}>, opts?: {addAssistant?: boolean})")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Array msgs = info[0].As<Napi::Array>();
+    uint32_t n_msg = msgs.Length();
+
+    // Parse options
+    bool add_assistant = true;
+    if (info.Length() >= 2 && info[1].IsObject()) {
+        Napi::Object opts = info[1].As<Napi::Object>();
+        if (opts.Has("addAssistant") && opts.Get("addAssistant").IsBoolean()) {
+            add_assistant = opts.Get("addAssistant").As<Napi::Boolean>().Value();
+        }
+    }
+
+    // Convert JS messages to llama_chat_message array.
+    // Keep std::string values alive until after the call.
+    std::vector<std::string> roles(n_msg);
+    std::vector<std::string> contents(n_msg);
+    std::vector<llama_chat_message> chat(n_msg);
+
+    for (uint32_t i = 0; i < n_msg; ++i) {
+        Napi::Value item = msgs.Get(i);
+        if (!item.IsObject()) {
+            Napi::TypeError::New(env, "Each message must be an object with 'role' and 'content'")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        Napi::Object msg = item.As<Napi::Object>();
+        roles[i]    = msg.Get("role").As<Napi::String>().Utf8Value();
+        contents[i] = msg.Get("content").As<Napi::String>().Utf8Value();
+        chat[i].role    = roles[i].c_str();
+        chat[i].content = contents[i].c_str();
+    }
+
+    // Get model's built-in template
+    const char * tmpl = llama_model_chat_template(model_, nullptr);
+
+    // First call: determine required buffer size
+    int32_t len = llama_chat_apply_template(tmpl, chat.data(), n_msg, add_assistant, nullptr, 0);
+    if (len < 0) {
+        Napi::Error::New(env, "Failed to apply chat template — template may be unsupported")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    // Second call: render into buffer
+    std::vector<char> buf(len + 1);
+    llama_chat_apply_template(tmpl, chat.data(), n_msg, add_assistant, buf.data(), buf.size());
+
+    return Napi::String::New(env, buf.data(), len);
 }

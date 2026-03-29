@@ -108,6 +108,17 @@ class LlamaModel {
     /** Jinja2 chat template embedded in the model metadata, or null. */
     get chatTemplate() { return this.#native.chatTemplate; }
 
+    /**
+     * Format messages using the model's built-in chat template.
+     *
+     * @param {Array<{role: string, content: string}>} messages
+     * @param {{ addAssistant?: boolean }} [opts]
+     * @returns {string}
+     */
+    applyChatTemplate(messages, opts = {}) {
+        return this.#native.applyChatTemplate(messages, opts);
+    }
+
     [Symbol.dispose]() { this.dispose(); }
 }
 
