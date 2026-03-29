@@ -105,6 +105,9 @@ class LlamaModel {
     /** Number of token slots in the current context window. */
     get contextLength() { return this.#native.contextLength; }
 
+    /** Jinja2 chat template embedded in the model metadata, or null. */
+    get chatTemplate() { return this.#native.chatTemplate; }
+
     [Symbol.dispose]() { this.dispose(); }
 }
 

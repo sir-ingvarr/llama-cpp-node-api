@@ -15,6 +15,7 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod<&LlamaModel::Abort>("abort"),
         InstanceMethod<&LlamaModel::Dispose>("dispose"),
         InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
+        InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
     });
 
     Napi::FunctionReference * ctor = new Napi::FunctionReference();
@@ -307,4 +308,20 @@ Napi::Value LlamaModel::ContextLength(const Napi::CallbackInfo & info) {
         return Napi::Number::New(env, 0);
     }
     return Napi::Number::New(env, (double)llama_n_ctx(ctx_));
+}
+
+// ---------------------------------------------------------------------------
+// chatTemplate getter
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::ChatTemplate(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+    if (!model_) {
+        return env.Null();
+    }
+    const char * tmpl = llama_model_chat_template(model_, nullptr);
+    if (!tmpl) {
+        return env.Null();
+    }
+    return Napi::String::New(env, tmpl);
 }

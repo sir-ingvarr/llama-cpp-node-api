@@ -59,6 +59,8 @@ export declare class LlamaModel {
     abort(): void;
     dispose(): void;
     readonly contextLength: number;
+    /** Jinja2 chat template embedded in the model metadata, or null if not present. */
+    readonly chatTemplate: string | null;
     [Symbol.dispose](): void;
 }
 

@@ -4,7 +4,10 @@
     "description": "Node.js native addon for llama.cpp — direct in-process inference",
     "main": "js/index.js",
     "types": "js/index.d.ts",
-    "repository": "https://github.com/sir-ingvarr/node-llama-cpp",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/sir-ingvarr/node-llama-cpp.git"
+    },
     "license": "MIT",
     "keywords": [
         "llama",
@@ -24,7 +27,10 @@
         "build:cuda": "cmake-js compile -- -DGGML_CUDA=ON",
         "build:cpu": "cmake-js compile -- -DGGML_METAL=OFF",
         "build:root": "cmake-js rebuild",
-        "rebuild": "cmake-js rebuild"
+        "rebuild": "cmake-js rebuild",
+        "build:arm64": "cmake-js compile --arch arm64",
+        "build:x64": "cmake-js compile --arch x64",
+        "update:llama": "git submodule update --remote vendor/llama.cpp"
     },
     "cmake-js": {
         "runtime": "electron",
