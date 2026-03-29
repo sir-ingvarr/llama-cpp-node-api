@@ -21,6 +21,7 @@
         "node": ">=18"
     },
     "scripts": {
+        "preinstall": "git submodule update --init --recursive",
         "install": "prebuild-install -r napi || cmake-js compile",
         "build": "cmake-js compile",
         "build:debug": "cmake-js compile --debug",
