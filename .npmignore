@@ -1,7 +1,13 @@
 build/
+npm/
+src/
+vendor/
 test/
 smoke.js
+CLAUDE.md
 .github/
 .DS_Store
 *.node
 prebuilds/
+CMakeLists.txt
+assets/

@@ -22,6 +22,9 @@ private:
     Napi::Value ContextLength(const Napi::CallbackInfo & info);
     Napi::Value ChatTemplate(const Napi::CallbackInfo & info);
     Napi::Value ApplyChatTemplate(const Napi::CallbackInfo & info);
+    Napi::Value Tokenize(const Napi::CallbackInfo & info);
+    Napi::Value Detokenize(const Napi::CallbackInfo & info);
+    Napi::Value GetModelInfo(const Napi::CallbackInfo & info);
 
     // Internal helpers
     bool EnsureContext(uint32_t n_ctx, std::string & error_out);

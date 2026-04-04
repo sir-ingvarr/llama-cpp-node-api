@@ -71,6 +71,8 @@ if(LLAMA_NODE_VENDOR)
     # host → arm64 target via CMAKE_OSX_ARCHITECTURES), so -mcpu=native is
     # invalid. Metal covers GPU acceleration; generic ARM code is fine.
     set(GGML_NATIVE          OFF CACHE BOOL "" FORCE)
+    # Strip dead code across translation units
+    set(GGML_LTO             ON  CACHE BOOL "" FORCE)
     add_subdirectory(vendor/llama.cpp)
 endif()
 

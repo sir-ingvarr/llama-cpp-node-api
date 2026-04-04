@@ -1,12 +1,12 @@
 {
-    "name": "llama-node",
+    "name": "llama-cpp-node-api",
     "version": "0.9.0",
     "description": "Node.js native addon for llama.cpp — direct in-process inference",
     "main": "js/index.js",
     "types": "js/index.d.ts",
     "repository": {
         "type": "git",
-        "url": "git+https://github.com/sir-ingvarr/node-llama-cpp.git"
+        "url": "git+https://github.com/sir-ingvarr/llama-cpp-node-api.git"
     },
     "license": "MIT",
     "keywords": [
@@ -21,8 +21,7 @@
         "node": ">=18"
     },
     "scripts": {
-        "preinstall": "git submodule update --init --recursive",
-        "install": "prebuild-install -r napi || cmake-js compile",
+        "preinstall": "test -d .git && git submodule update --init --recursive || true",
         "build": "cmake-js compile",
         "build:debug": "cmake-js compile --debug",
         "build:cuda": "cmake-js compile -- -DGGML_CUDA=ON",
@@ -38,21 +37,20 @@
         "runtimeVersion": "35.0.0",
         "silent": false
     },
-    "binary": {
-        "module_name": "llama_node",
-        "module_path": "build/Release",
-        "napi_versions": [8]
-    },
     "files": [
         "js/",
-        "src/",
-        "vendor/",
-        "CMakeLists.txt",
-        "package.json"
+        "LICENSE",
+        "README.md"
     ],
-    "dependencies": {
+    "dependencies": {},
+    "devDependencies": {
         "cmake-js": "^8.0.0",
-        "node-addon-api": "^8.3.0",
-        "prebuild-install": "^7.1.3"
+        "node-addon-api": "^8.3.0"
+    },
+    "optionalDependencies": {
+        "@llama-cpp-node-api/darwin-arm64": "0.9.0",
+        "@llama-cpp-node-api/darwin-x64": "0.9.0",
+        "@llama-cpp-node-api/linux-x64": "0.9.0",
+        "@llama-cpp-node-api/win32-x64": "0.9.0"
     }
 }

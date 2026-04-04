@@ -3,7 +3,35 @@
 const fs   = require('fs');
 const path = require('path');
 
-const addon = require(path.resolve(__dirname, '..', 'build', 'Release', 'llama_node.node'));
+const PLATFORMS = {
+    'darwin-arm64': '@llama-cpp-node-api/darwin-arm64',
+    'darwin-x64':   '@llama-cpp-node-api/darwin-x64',
+    'linux-x64':    '@llama-cpp-node-api/linux-x64',
+    'win32-x64':    '@llama-cpp-node-api/win32-x64',
+};
+
+function loadAddon() {
+    // 1. Try platform-specific npm package
+    const key = `${process.platform}-${process.arch}`;
+    const pkg = PLATFORMS[key];
+    if (pkg) {
+        try { return require(pkg); } catch (_) {}
+    }
+
+    // 2. Fallback to local build (development / unsupported platform)
+    try {
+        return require(path.resolve(__dirname, '..', 'build', 'Release', 'llama_node.node'));
+    } catch (_) {}
+
+    throw new Error(
+        `llama-cpp-node-api: no prebuilt binary for ${key}.\n` +
+        'Supported platforms: darwin-arm64, darwin-x64, linux-x64, win32-x64.\n' +
+        'To build from source, install from git instead:\n' +
+        '  npm install git+https://github.com/sir-ingvarr/llama-cpp-node-api.git'
+    );
+}
+
+const addon = loadAddon();
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -117,6 +145,37 @@ class LlamaModel {
      */
     applyChatTemplate(messages, opts = {}) {
         return this.#native.applyChatTemplate(messages, opts);
+    }
+
+    /**
+     * Convert text to token IDs.
+     *
+     * @param {string} text
+     * @param {{ addSpecial?: boolean, parseSpecial?: boolean }} [opts]
+     * @returns {number[]}
+     */
+    tokenize(text, opts = {}) {
+        return this.#native.tokenize(text, opts);
+    }
+
+    /**
+     * Convert token IDs back to text.
+     *
+     * @param {number[]} tokens
+     * @param {{ removeSpecial?: boolean, unparseSpecial?: boolean }} [opts]
+     * @returns {string}
+     */
+    detokenize(tokens, opts = {}) {
+        return this.#native.detokenize(tokens, opts);
+    }
+
+    /**
+     * Returns model metadata: description, parameter count, sizes, special tokens, etc.
+     *
+     * @returns {import('./index').ModelInfo}
+     */
+    getModelInfo() {
+        return this.#native.getModelInfo();
     }
 
     [Symbol.dispose]() { this.dispose(); }

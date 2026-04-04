@@ -1,0 +1,14 @@
+{
+    "name": "@llama-cpp-node-api/darwin-arm64",
+    "version": "0.9.0",
+    "description": "llama-cpp-node-api native binary for macOS ARM64",
+    "os": ["darwin"],
+    "cpu": ["arm64"],
+    "main": "llama_node.node",
+    "files": ["llama_node.node"],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/sir-ingvarr/llama-cpp-node-api.git"
+    }
+}

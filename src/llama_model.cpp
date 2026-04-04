@@ -17,6 +17,9 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
         InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
         InstanceMethod<&LlamaModel::ApplyChatTemplate>("applyChatTemplate"),
+        InstanceMethod<&LlamaModel::Tokenize>("tokenize"),
+        InstanceMethod<&LlamaModel::Detokenize>("detokenize"),
+        InstanceMethod<&LlamaModel::GetModelInfo>("getModelInfo"),
     });
 
     Napi::FunctionReference * ctor = new Napi::FunctionReference();
@@ -395,4 +398,142 @@ Napi::Value LlamaModel::ApplyChatTemplate(const Napi::CallbackInfo & info) {
     llama_chat_apply_template(tmpl, chat.data(), n_msg, add_assistant, buf.data(), buf.size());
 
     return Napi::String::New(env, buf.data(), len);
+}
+
+// ---------------------------------------------------------------------------
+// tokenize(text, opts?)
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::Tokenize(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (info.Length() < 1 || !info[0].IsString()) {
+        Napi::TypeError::New(env, "tokenize(text: string, opts?: {addSpecial?: boolean, parseSpecial?: boolean})")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    std::string text = info[0].As<Napi::String>().Utf8Value();
+
+    bool add_special   = true;
+    bool parse_special  = false;
+    if (info.Length() >= 2 && info[1].IsObject()) {
+        Napi::Object opts = info[1].As<Napi::Object>();
+        if (opts.Has("addSpecial") && opts.Get("addSpecial").IsBoolean())
+            add_special = opts.Get("addSpecial").As<Napi::Boolean>().Value();
+        if (opts.Has("parseSpecial") && opts.Get("parseSpecial").IsBoolean())
+            parse_special = opts.Get("parseSpecial").As<Napi::Boolean>().Value();
+    }
+
+    // First call with negative n_tokens_max to get the required count
+    int32_t n = llama_tokenize(vocab_, text.c_str(), text.size(), nullptr, 0, add_special, parse_special);
+    if (n < 0) n = -n;
+
+    std::vector<llama_token> tokens(n);
+    int32_t actual = llama_tokenize(vocab_, text.c_str(), text.size(), tokens.data(), tokens.size(), add_special, parse_special);
+    if (actual < 0) {
+        Napi::Error::New(env, "Tokenization failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    tokens.resize(actual);
+
+    Napi::Array result = Napi::Array::New(env, tokens.size());
+    for (size_t i = 0; i < tokens.size(); ++i) {
+        result.Set(i, Napi::Number::New(env, tokens[i]));
+    }
+    return result;
+}
+
+// ---------------------------------------------------------------------------
+// detokenize(tokens, opts?)
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::Detokenize(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    if (info.Length() < 1 || !info[0].IsArray()) {
+        Napi::TypeError::New(env, "detokenize(tokens: number[], opts?: {removeSpecial?: boolean, unparseSpecial?: boolean})")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Array arr = info[0].As<Napi::Array>();
+    uint32_t n = arr.Length();
+    std::vector<llama_token> tokens(n);
+    for (uint32_t i = 0; i < n; ++i) {
+        tokens[i] = arr.Get(i).As<Napi::Number>().Int32Value();
+    }
+
+    bool remove_special = false;
+    bool unparse_special = false;
+    if (info.Length() >= 2 && info[1].IsObject()) {
+        Napi::Object opts = info[1].As<Napi::Object>();
+        if (opts.Has("removeSpecial") && opts.Get("removeSpecial").IsBoolean())
+            remove_special = opts.Get("removeSpecial").As<Napi::Boolean>().Value();
+        if (opts.Has("unparseSpecial") && opts.Get("unparseSpecial").IsBoolean())
+            unparse_special = opts.Get("unparseSpecial").As<Napi::Boolean>().Value();
+    }
+
+    // First call to get required size
+    int32_t len = llama_detokenize(vocab_, tokens.data(), tokens.size(), nullptr, 0, remove_special, unparse_special);
+    if (len < 0) len = -len;
+
+    std::vector<char> buf(len + 1);
+    int32_t actual = llama_detokenize(vocab_, tokens.data(), tokens.size(), buf.data(), buf.size(), remove_special, unparse_special);
+    if (actual < 0) {
+        Napi::Error::New(env, "Detokenization failed").ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    return Napi::String::New(env, buf.data(), actual);
+}
+
+// ---------------------------------------------------------------------------
+// getModelInfo()
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::GetModelInfo(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object obj = Napi::Object::New(env);
+
+    // Description
+    char desc_buf[256];
+    llama_model_desc(model_, desc_buf, sizeof(desc_buf));
+    obj.Set("description", Napi::String::New(env, desc_buf));
+
+    // Numeric properties
+    obj.Set("nParams",           Napi::Number::New(env, (double)llama_model_n_params(model_)));
+    obj.Set("modelSize",         Napi::Number::New(env, (double)llama_model_size(model_)));
+    obj.Set("trainContextLength", Napi::Number::New(env, llama_model_n_ctx_train(model_)));
+    obj.Set("embeddingSize",     Napi::Number::New(env, llama_model_n_embd(model_)));
+    obj.Set("nLayer",            Napi::Number::New(env, llama_model_n_layer(model_)));
+    obj.Set("vocabSize",         Napi::Number::New(env, llama_vocab_n_tokens(vocab_)));
+
+    // Special tokens
+    Napi::Object tokens = Napi::Object::New(env);
+    tokens.Set("bos", Napi::Number::New(env, llama_vocab_bos(vocab_)));
+    tokens.Set("eos", Napi::Number::New(env, llama_vocab_eos(vocab_)));
+    tokens.Set("eot", Napi::Number::New(env, llama_vocab_eot(vocab_)));
+    obj.Set("specialTokens", tokens);
+
+    return obj;
 }

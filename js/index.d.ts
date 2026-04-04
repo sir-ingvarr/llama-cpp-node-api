@@ -63,6 +63,48 @@ export interface ApplyChatTemplateOptions {
     addAssistant?: boolean;
 }
 
+export interface TokenizeOptions {
+    /** Add BOS/EOS special tokens. Default: true. */
+    addSpecial?: boolean;
+    /** Parse special token syntax in the text (e.g. <|im_start|>). Default: false. */
+    parseSpecial?: boolean;
+}
+
+export interface DetokenizeOptions {
+    /** Remove special tokens from output. Default: false. */
+    removeSpecial?: boolean;
+    /** Render special tokens as their text representation. Default: false. */
+    unparseSpecial?: boolean;
+}
+
+export interface SpecialTokens {
+    /** Beginning-of-sequence token ID. */
+    bos: number;
+    /** End-of-sequence token ID. */
+    eos: number;
+    /** End-of-turn token ID. */
+    eot: number;
+}
+
+export interface ModelInfo {
+    /** Human-readable model description (e.g. "llama 8B Q4_0"). */
+    description: string;
+    /** Total number of parameters. */
+    nParams: number;
+    /** Model size on disk in bytes. */
+    modelSize: number;
+    /** Context length the model was trained with. */
+    trainContextLength: number;
+    /** Embedding vector dimension. */
+    embeddingSize: number;
+    /** Number of transformer layers. */
+    nLayer: number;
+    /** Vocabulary size (number of tokens). */
+    vocabSize: number;
+    /** Special token IDs. */
+    specialTokens: SpecialTokens;
+}
+
 export declare class LlamaModel {
     constructor(modelPath: string, opts?: LlamaModelOptions);
     generate(prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, undefined>;
@@ -71,6 +113,12 @@ export declare class LlamaModel {
      * Uses llama.cpp's built-in template renderer (not a full Jinja parser).
      */
     applyChatTemplate(messages: ChatMessage[], opts?: ApplyChatTemplateOptions): string;
+    /** Convert text to token IDs. */
+    tokenize(text: string, opts?: TokenizeOptions): number[];
+    /** Convert token IDs back to text. */
+    detokenize(tokens: number[], opts?: DetokenizeOptions): string;
+    /** Returns model metadata: description, parameter count, sizes, special tokens. */
+    getModelInfo(): ModelInfo;
     abort(): void;
     dispose(): void;
     readonly contextLength: number;

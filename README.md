@@ -1,4 +1,8 @@
-gst# llama-node
+# llama-cpp-node-api
+
+<p align="center">
+  <img src="assets/logo.png" alt="llama-cpp-node-api logo" width="200" />
+</p>
 
 > **Warning: this is a vibe-coded library.** It was built with AI assistance, has no test suite, and has seen limited real-world use. The API may change. Use in production at your own risk.
 
@@ -23,7 +27,7 @@ The `vendor/llama.cpp` submodule is built automatically. On macOS, Metal acceler
 ## Usage
 
 ```js
-const { LlamaModel } = require('llama-node');
+const { LlamaModel } = require('llama-cpp-node-api');
 
 const model = new LlamaModel('/path/to/model.gguf', { nGpuLayers: 99 });
 
@@ -34,7 +38,22 @@ for await (const token of model.generate(prompt, { nPredict: 256 })) {
 model.dispose();
 ```
 
-Prompts must be pre-formatted with the model's chat template. The addon passes the string directly to the tokenizer.
+### Chat templates
+
+Models embed a Jinja2-style chat template in their metadata. Use `applyChatTemplate()` to format messages instead of hand-crafting prompts:
+
+```js
+const formatted = model.applyChatTemplate([
+    { role: 'system', content: 'You are a helpful assistant.' },
+    { role: 'user', content: 'Hello!' },
+]);
+
+for await (const token of model.generate(formatted, { nPredict: 256 })) {
+    process.stdout.write(token);
+}
+```
+
+You can also inspect the raw template string via `model.chatTemplate`.
 
 ## API
 
@@ -64,6 +83,18 @@ Returns an `AsyncGenerator<string>` that yields token text pieces.
 | `nCtx` | — | Override context size for this call. |
 | `resetContext` | `false` | Clear KV cache before generating (start fresh). |
 
+### `model.chatTemplate`
+
+The Jinja2 chat template string embedded in the model's metadata, or `null` if the model doesn't include one.
+
+### `model.applyChatTemplate(messages, opts?)`
+
+Formats an array of `{ role, content }` messages using the model's built-in template. Returns the formatted prompt string.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `addAssistant` | `true` | Append the assistant turn prefix so the model continues naturally. |
+
 ### `model.abort()`
 
 Signals the running generation to stop at the next token boundary.
@@ -81,7 +112,7 @@ Number of token slots in the current context window. `0` before the first `gener
 Manages multiple named models, loading each lazily on first use.
 
 ```js
-const { LlamaModelPool } = require('llama-node');
+const { LlamaModelPool } = require('llama-cpp-node-api');
 
 const pool = new LlamaModelPool();
 pool.register('fast', '/models/phi-3-mini.gguf', { nGpuLayers: 99 });
