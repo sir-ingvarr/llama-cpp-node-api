@@ -44,7 +44,7 @@ jobs:
         run: npm install --ignore-scripts
 
       - name: Build native module
-        run: npx cmake-js compile --release -r node
+        run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
 
       - name: Copy binary into platform package
         shell: bash
