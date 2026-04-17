@@ -68,6 +68,8 @@ You can also inspect the raw template string via `model.chatTemplate`.
 
 Returns an `AsyncGenerator<string>` that yields token text pieces.
 
+Concurrent calls on the same model are allowed — they queue internally and execute one at a time (llama.cpp's context is not thread-safe). The JS event loop is never blocked while a generation is running, so timers, I/O, and abort signals keep firing.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `nPredict` | `256` | Max tokens. `0` or negative = unlimited. |
@@ -82,6 +84,25 @@ Returns an `AsyncGenerator<string>` that yields token text pieces.
 | `stop` | `[]` | Stop sequences. Generation halts on first match; the sequence is not included in output. |
 | `nCtx` | — | Override context size for this call. |
 | `resetContext` | `false` | Clear KV cache before generating (start fresh). |
+| `signal` | — | `AbortSignal` that cancels **this** call. The generator throws an `AbortError` on the next iteration. Other concurrent calls are unaffected. |
+
+#### Cancelling generations
+
+```js
+// Cancel a single call:
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 5_000);
+try {
+    for await (const t of model.generate(prompt, { signal: ac.signal })) {
+        process.stdout.write(t);
+    }
+} catch (e) {
+    if (e.name !== 'AbortError') throw e;
+}
+
+// Cancel every in-flight and queued call on this model:
+model.abort();
+```
 
 ### `model.chatTemplate`
 
@@ -97,7 +118,7 @@ Formats an array of `{ role, content }` messages using the model's built-in temp
 
 ### `model.abort()`
 
-Signals the running generation to stop at the next token boundary.
+Cancels every currently running and queued generation on this model. Each call stops at its next token boundary. For cancelling a single call only, use `opts.signal` on that call (see above).
 
 ### `model.dispose()`
 
@@ -124,6 +145,33 @@ for await (const token of pool.generate('fast', prompt, { nPredict: 128 })) {
 
 pool.dispose();
 ```
+
+### `quantize(inputPath, outputPath, opts)`
+
+Requantizes a GGUF file to a different ftype. Runs on a libuv worker thread and returns a `Promise<void>` that resolves once the output has been written. Progress is printed to stderr by llama.cpp.
+
+```js
+const { quantize, quantizeFtypes } = require('llama-cpp-node-api');
+
+console.log(quantizeFtypes());            // → ['F16', 'Q4_K_M', 'Q8_0', ...]
+
+await quantize('/models/model-f16.gguf',
+               '/models/model-q4_k_m.gguf',
+               { ftype: 'Q4_K_M' });
+```
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `ftype` | **required** | Target quantization. Accepts a string name (e.g. `'Q4_K_M'`) or the raw `llama_ftype` enum value. Use `quantizeFtypes()` to list all accepted names. |
+| `nthread` | hardware concurrency | Threads to use. |
+| `allowRequantize` | `false` | Allow re-quantizing tensors that are not f32/f16. |
+| `quantizeOutputTensor` | `true` | Quantize `output.weight` too. |
+| `onlyCopy` | `false` | Copy tensors as-is (useful for shard repacking). |
+| `pure` | `false` | Quantize every tensor to the default type (no per-tensor overrides). |
+| `keepSplit` | `false` | Preserve the input's shard count. |
+| `dryRun` | `false` | Compute and report final size without writing the output. |
+
+Note: this wraps `llama_model_quantize` (C API). Converting from safetensors / Hugging Face formats to GGUF is not included — that path lives in llama.cpp's `convert_hf_to_gguf.py` and requires a Python environment with `torch`, `safetensors`, etc.
 
 ## Build variants
 

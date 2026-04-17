@@ -51,6 +51,12 @@ export interface GenerateOptions {
      * Use this to start a fresh conversation. Default: false (accumulate context).
      */
     resetContext?: boolean;
+    /**
+     * AbortSignal that cancels this specific generation when fired. The async
+     * generator will throw an `AbortError` on the next iteration. Unlike
+     * `model.abort()`, other concurrent generations are unaffected.
+     */
+    signal?: AbortSignal;
 }
 
 export interface ChatMessage {
@@ -105,8 +111,51 @@ export interface ModelInfo {
     specialTokens: SpecialTokens;
 }
 
+/**
+ * Names accepted by `QuantizeOptions.ftype`. Mirrors llama.cpp's CLI
+ * ftype names (the `LLAMA_FTYPE_MOSTLY_` prefix stripped).
+ */
+export type QuantizeFtype =
+    | 'F32' | 'F16' | 'BF16'
+    | 'Q4_0' | 'Q4_1' | 'Q5_0' | 'Q5_1' | 'Q8_0'
+    | 'Q2_K' | 'Q2_K_S'
+    | 'Q3_K_S' | 'Q3_K_M' | 'Q3_K_L'
+    | 'Q4_K_S' | 'Q4_K_M'
+    | 'Q5_K_S' | 'Q5_K_M'
+    | 'Q6_K'
+    | 'IQ2_XXS' | 'IQ2_XS' | 'IQ2_S' | 'IQ2_M'
+    | 'IQ3_XXS' | 'IQ3_XS' | 'IQ3_S' | 'IQ3_M'
+    | 'IQ1_S' | 'IQ1_M'
+    | 'IQ4_NL' | 'IQ4_XS'
+    | 'TQ1_0' | 'TQ2_0'
+    | 'MXFP4_MOE' | 'NVFP4' | 'Q1_0';
+
+export interface QuantizeOptions {
+    /** Target quantization ftype. Required. Accepts a string name or the raw enum value. */
+    ftype: QuantizeFtype | number;
+    /** Number of threads. Default: hardware concurrency. */
+    nthread?: number;
+    /** Allow re-quantizing tensors that are not f32/f16. Default: false. */
+    allowRequantize?: boolean;
+    /** Quantize `output.weight` too. Default: true. */
+    quantizeOutputTensor?: boolean;
+    /** Skip quantization — copy tensors as-is. Useful for shard repacking. */
+    onlyCopy?: boolean;
+    /** Quantize every tensor to the default type (no per-tensor overrides). */
+    pure?: boolean;
+    /** Preserve the input's shard count. */
+    keepSplit?: boolean;
+    /** Compute and report final size without actually writing the output. */
+    dryRun?: boolean;
+}
+
 export declare class LlamaModel {
     constructor(modelPath: string, opts?: LlamaModelOptions);
+    /**
+     * Yields tokens for a single generation. Concurrent calls are allowed —
+     * they queue inside the model; only one generation runs at a time.
+     * Use `opts.signal` to cancel an individual call; `abort()` cancels all.
+     */
     generate(prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, undefined>;
     /**
      * Format messages using the model's built-in chat template.
@@ -119,6 +168,7 @@ export declare class LlamaModel {
     detokenize(tokens: number[], opts?: DetokenizeOptions): string;
     /** Returns model metadata: description, parameter count, sizes, special tokens. */
     getModelInfo(): ModelInfo;
+    /** Cancel every currently running and queued generation on this model. */
     abort(): void;
     dispose(): void;
     readonly contextLength: number;
@@ -159,3 +209,16 @@ export declare class LlamaModelPool {
 
     [Symbol.dispose](): void;
 }
+
+/**
+ * Convert a GGUF file from one quantization to another. Runs on a worker
+ * thread; the returned Promise resolves once the output has been written.
+ */
+export declare function quantize(
+    inputPath: string,
+    outputPath: string,
+    opts: QuantizeOptions
+): Promise<void>;
+
+/** List of ftype names accepted by `quantize()`. */
+export declare function quantizeFtypes(): QuantizeFtype[];

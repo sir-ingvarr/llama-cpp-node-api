@@ -1,8 +1,8 @@
 #include "llama_model.h"
 #include "generate_worker.h"
 
-#include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 // ---------------------------------------------------------------------------
@@ -13,6 +13,7 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
     Napi::Function func = DefineClass(env, "LlamaModel", {
         InstanceMethod<&LlamaModel::Generate>("generate"),
         InstanceMethod<&LlamaModel::Abort>("abort"),
+        InstanceMethod<&LlamaModel::AbortRequest>("abortRequest"),
         InstanceMethod<&LlamaModel::Dispose>("dispose"),
         InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
         InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
@@ -82,6 +83,8 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
 
 LlamaModel::~LlamaModel() {
     if (!disposed_) {
+        CancelAll();
+        std::lock_guard<std::mutex> lock(ctx_mutex_);
         if (ctx_) {
             llama_free(ctx_);
             ctx_ = nullptr;
@@ -94,17 +97,34 @@ LlamaModel::~LlamaModel() {
 }
 
 // ---------------------------------------------------------------------------
-// AbortCallback (static) — called from llama_decode on the worker thread
+// AbortCallback — invoked from inside llama_decode on the worker thread.
+// Reads the active request's cancel flag. Only the worker holding ctx_mutex_
+// writes active_request_, and llama_decode runs on that same thread, so no
+// additional synchronisation is required here.
 // ---------------------------------------------------------------------------
 
 bool LlamaModel::AbortCallback(void * data) {
-    return static_cast<LlamaModel *>(data)->cancel_.load(
-        std::memory_order_relaxed);
+    auto * self = static_cast<LlamaModel *>(data);
+    auto & state = self->active_request_;
+    return state && state->cancel.load(std::memory_order_relaxed);
 }
 
 // ---------------------------------------------------------------------------
 // EnsureContext — create/reuse ctx_
 // ---------------------------------------------------------------------------
+
+bool LlamaModel::PrepareContextLocked(uint32_t n_ctx, bool reset, std::string & error_out) {
+    if (disposed_ || !model_) {
+        error_out = "LlamaModel has been disposed";
+        return false;
+    }
+    if (reset && ctx_) {
+        llama_free(ctx_);
+        ctx_   = nullptr;
+        n_ctx_ = 0;
+    }
+    return EnsureContext(n_ctx, error_out);
+}
 
 bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
     if (ctx_ && n_ctx_ == n_ctx) {
@@ -133,16 +153,38 @@ bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
 }
 
 // ---------------------------------------------------------------------------
-// generate(prompt, opts, onToken, onDone)
+// CancelAll — flip the cancel flag on every tracked request.
+// Used from abort() and Dispose() to unblock queued and running workers.
 // ---------------------------------------------------------------------------
 
-void LlamaModel::Generate(const Napi::CallbackInfo & info) {
+void LlamaModel::CancelAll() {
+    std::lock_guard<std::mutex> lk(req_mutex_);
+    for (auto & [id, state] : requests_) {
+        (void)id;
+        state->cancel.store(true, std::memory_order_relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// UnregisterRequest — called from the JS-side wrapped_done after completion.
+// ---------------------------------------------------------------------------
+
+void LlamaModel::UnregisterRequest(uint32_t req_id) {
+    std::lock_guard<std::mutex> lk(req_mutex_);
+    requests_.erase(req_id);
+}
+
+// ---------------------------------------------------------------------------
+// generate(prompt, opts, onToken, onDone) → request id
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
     Napi::Env env = info.Env();
 
     if (disposed_) {
         Napi::Error::New(env, "LlamaModel has been disposed")
             .ThrowAsJavaScriptException();
-        return;
+        return env.Undefined();
     }
 
     if (info.Length() < 4 ||
@@ -153,13 +195,7 @@ void LlamaModel::Generate(const Napi::CallbackInfo & info) {
         Napi::TypeError::New(env,
             "generate(prompt: string, opts: object, onToken: fn, onDone: fn)")
             .ThrowAsJavaScriptException();
-        return;
-    }
-
-    if (generating_.exchange(true)) {
-        Napi::Error::New(env, "Already generating — call abort() first")
-            .ThrowAsJavaScriptException();
-        return;
+        return env.Undefined();
     }
 
     std::string prompt = info[0].As<Napi::String>().Utf8Value();
@@ -220,77 +256,93 @@ void LlamaModel::Generate(const Napi::CallbackInfo & info) {
         reset_context = opts.Get("resetContext").As<Napi::Boolean>().Value();
     }
 
-    // Ensure context exists (may recreate if n_ctx changed)
-    if (reset_context && ctx_) {
-        llama_free(ctx_);
-        ctx_  = nullptr;
-        n_ctx_ = 0;
-    }
+    // Context setup (possibly involving llama_free / llama_init_from_model)
+    // is done by the worker under ctx_mutex_ — never on the JS main thread,
+    // which would block Node's event loop while other generations decode.
 
-    std::string ctx_error;
-    if (!EnsureContext(n_ctx, ctx_error)) {
-        generating_.store(false);
-        Napi::Error::New(env, ctx_error).ThrowAsJavaScriptException();
-        return;
+    // Allocate a request state + id and register it so abort() can find it.
+    auto state = std::make_shared<RequestState>();
+    uint32_t req_id;
+    {
+        std::lock_guard<std::mutex> lk(req_mutex_);
+        req_id = next_req_id_++;
+        state->id = req_id;
+        requests_[req_id] = state;
     }
-
-    // Reset cancel flag before starting
-    cancel_.store(false);
 
     // Hold a strong reference to this JS object so the GC cannot collect it
     // while the worker thread is running.
     this->Ref();
 
-    // Wrap done_cb in a thin function that:
-    //   1. Drops the strong ref so the model can be GC'd once generation ends.
-    //   2. Clears the generating_ flag.
+    // Wrap done_cb so it:
+    //   1. Removes the request from the map.
+    //   2. Drops the strong ref.
     //   3. Forwards to the caller's done callback.
-    std::atomic<bool> * gen_flag = &generating_;
     LlamaModel * self = this;
     Napi::Function wrapped_done = Napi::Function::New(env,
-        [done_cb_ref = Napi::Persistent(done_cb), gen_flag, self]
+        [done_cb_ref = Napi::Persistent(done_cb), self, req_id]
         (const Napi::CallbackInfo & ci) mutable {
+            self->UnregisterRequest(req_id);
             self->Unref();
-            gen_flag->store(false);
             Napi::Value arg = ci.Length() > 0 ? ci[0] : ci.Env().Null();
             done_cb_ref.Call({arg});
         }, "wrappedDone");
 
     auto * worker = new GenerateWorker(
         token_cb, wrapped_done,
-        ctx_, vocab_,
-        ctx_mutex_, cancel_,
+        this, state,
         prompt,
+        n_ctx, reset_context,
         n_predict, temperature, top_p, top_k,
         min_p, repeat_penalty, repeat_last_n,
         std::move(grammar_str), std::move(stop_sequences)
     );
 
     worker->Queue();
+
+    return Napi::Number::New(env, (double)req_id);
 }
 
 // ---------------------------------------------------------------------------
-// abort()
+// abort() — cancel current + all queued.
 // ---------------------------------------------------------------------------
 
 void LlamaModel::Abort(const Napi::CallbackInfo & /*info*/) {
-    cancel_.store(true, std::memory_order_relaxed);
+    CancelAll();
 }
 
 // ---------------------------------------------------------------------------
-// dispose()
+// abortRequest(id) — cancel a specific in-flight or queued request.
 // ---------------------------------------------------------------------------
 
-void LlamaModel::Dispose(const Napi::CallbackInfo & info) {
+void LlamaModel::AbortRequest(const Napi::CallbackInfo & info) {
+    if (info.Length() < 1 || !info[0].IsNumber()) {
+        return;
+    }
+    uint32_t id = info[0].As<Napi::Number>().Uint32Value();
+    std::lock_guard<std::mutex> lk(req_mutex_);
+    auto it = requests_.find(id);
+    if (it != requests_.end()) {
+        it->second->cancel.store(true, std::memory_order_relaxed);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// dispose() — cancel all, wait for current to finish, free resources.
+// ---------------------------------------------------------------------------
+
+void LlamaModel::Dispose(const Napi::CallbackInfo & /*info*/) {
     if (disposed_) {
         return;
     }
 
-    // Wait for any ongoing generation to finish before freeing resources
+    // Signal every tracked request to stop; queued workers will fast-reject.
+    CancelAll();
+
+    // Wait for the currently running worker (if any) to release the ctx.
     std::lock_guard<std::mutex> lock(ctx_mutex_);
 
     disposed_ = true;
-    cancel_.store(true);
 
     if (ctx_) {
         llama_free(ctx_);

@@ -81,6 +81,7 @@ add_library(llama_node SHARED
     src/addon.cpp
     src/llama_model.cpp
     src/generate_worker.cpp
+    src/quantize_worker.cpp
 )
 
 set_target_properties(llama_node PROPERTIES
