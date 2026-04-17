@@ -30,7 +30,9 @@
         "rebuild": "cmake-js rebuild",
         "build:arm64": "cmake-js compile --arch arm64",
         "build:x64": "cmake-js compile --arch x64",
-        "update:llama": "git submodule update --remote vendor/llama.cpp"
+        "update:llama": "git submodule update --remote vendor/llama.cpp",
+        "sync:versions": "node scripts/sync-versions.js",
+        "version": "node scripts/sync-versions.js && git add npm/*/package.json package.json"
     },
     "cmake-js": {
         "runtime": "electron",
@@ -48,9 +50,9 @@
         "node-addon-api": "^8.3.0"
     },
     "optionalDependencies": {
-        "@llama-cpp-node-api/darwin-arm64": "0.9.1",
-        "@llama-cpp-node-api/darwin-x64": "0.9.1",
-        "@llama-cpp-node-api/linux-x64": "0.9.1",
-        "@llama-cpp-node-api/win32-x64": "0.9.1"
+        "@llama-cpp-node-api/darwin-arm64": "0.10.0",
+        "@llama-cpp-node-api/darwin-x64": "0.10.0",
+        "@llama-cpp-node-api/linux-x64": "0.10.0",
+        "@llama-cpp-node-api/win32-x64": "0.10.0"
     }
 }
