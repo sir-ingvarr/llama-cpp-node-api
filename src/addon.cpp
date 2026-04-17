@@ -2,6 +2,7 @@
 #include "llama.h"
 #include "ggml-backend.h"
 #include "llama_model.h"
+#include "quantize_worker.h"
 
 static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     // Suppress info/warn log levels; only pass through errors
@@ -23,6 +24,7 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     env.AddCleanupHook([]() { llama_backend_free(); });
 
     LlamaModel::Init(env, exports);
+    RegisterQuantize(env, exports);
     return exports;
 }
 

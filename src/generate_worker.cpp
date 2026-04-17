@@ -27,29 +27,29 @@ static size_t complete_utf8_boundary(const std::string & s) {
 }
 
 GenerateWorker::GenerateWorker(
-    Napi::Function &         token_cb,
-    Napi::Function &         done_cb,
-    llama_context *          ctx,
-    const llama_vocab *      vocab,
-    std::mutex &             ctx_mutex,
-    std::atomic<bool> &      cancel,
-    const std::string &      prompt,
-    int32_t                  n_predict,
-    float                    temperature,
-    float                    top_p,
-    int32_t                  top_k,
-    float                    min_p,
-    float                    repeat_penalty,
-    int32_t                  repeat_last_n,
-    std::string              grammar_str,
-    std::vector<std::string> stop_sequences
+    Napi::Function &                  token_cb,
+    Napi::Function &                  done_cb,
+    LlamaModel *                      owner,
+    std::shared_ptr<RequestState>     state,
+    const std::string &               prompt,
+    uint32_t                          n_ctx,
+    bool                              reset_context,
+    int32_t                           n_predict,
+    float                             temperature,
+    float                             top_p,
+    int32_t                           top_k,
+    float                             min_p,
+    float                             repeat_penalty,
+    int32_t                           repeat_last_n,
+    std::string                       grammar_str,
+    std::vector<std::string>          stop_sequences
 )
     : Napi::AsyncProgressQueueWorker<TokenChunk>(token_cb.Env()),
-      ctx_(ctx),
-      vocab_(vocab),
-      ctx_mutex_(ctx_mutex),
-      cancel_(cancel),
+      owner_(owner),
+      state_(std::move(state)),
       prompt_(prompt),
+      n_ctx_(n_ctx),
+      reset_context_(reset_context),
       n_predict_(n_predict),
       temperature_(temperature),
       top_p_(top_p),
@@ -94,33 +94,64 @@ static size_t trailing_stop_prefix(
 // ---------------------------------------------------------------------------
 
 void GenerateWorker::Execute(const ExecutionProgress & progress) {
-    std::unique_lock<std::mutex> lock(ctx_mutex_);
+    // Fast-reject if cancelled while queued, before contending for the ctx mutex.
+    if (state_->cancel.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    std::unique_lock<std::mutex> lock(owner_->ctx_mutex());
+
+    // Another caller may have disposed the model while we waited.
+    if (owner_->disposed()) {
+        return;
+    }
+    // Recheck cancel after acquiring the mutex — may have been flipped while waiting.
+    if (state_->cancel.load(std::memory_order_relaxed)) {
+        return;
+    }
+
+    // Prepare the context now (on the worker thread) so the JS main thread
+    // never blocks on ctx_mutex_. See LlamaModel::PrepareContextLocked.
+    std::string ctx_err;
+    if (!owner_->PrepareContextLocked(n_ctx_, reset_context_, ctx_err)) {
+        SetError(ctx_err);
+        return;
+    }
+
+    // Register ourselves as the active request so AbortCallback reads our cancel.
+    owner_->set_active_request(state_);
+
+    llama_context *     ctx   = owner_->ctx();
+    const llama_vocab * vocab = owner_->vocab();
 
     const bool is_first =
-        llama_memory_seq_pos_max(llama_get_memory(ctx_), 0) == -1;
+        llama_memory_seq_pos_max(llama_get_memory(ctx), 0) == -1;
 
     // Tokenize
     const int n_prompt_tokens_neg =
-        -llama_tokenize(vocab_, prompt_.c_str(), (int32_t)prompt_.size(),
+        -llama_tokenize(vocab, prompt_.c_str(), (int32_t)prompt_.size(),
                         nullptr, 0, is_first, true);
     if (n_prompt_tokens_neg <= 0) {
+        owner_->clear_active_request();
         SetError("llama_tokenize: empty result");
         return;
     }
 
     std::vector<llama_token> prompt_tokens((size_t)n_prompt_tokens_neg);
-    if (llama_tokenize(vocab_, prompt_.c_str(), (int32_t)prompt_.size(),
+    if (llama_tokenize(vocab, prompt_.c_str(), (int32_t)prompt_.size(),
                        prompt_tokens.data(), (int32_t)prompt_tokens.size(),
                        is_first, true) < 0) {
+        owner_->clear_active_request();
         SetError("llama_tokenize: failed");
         return;
     }
 
     // Check context capacity
-    const int n_ctx      = llama_n_ctx(ctx_);
+    const int n_ctx      = llama_n_ctx(ctx);
     const int n_ctx_used =
-        (int)(llama_memory_seq_pos_max(llama_get_memory(ctx_), 0) + 1);
+        (int)(llama_memory_seq_pos_max(llama_get_memory(ctx), 0) + 1);
     if (n_ctx_used + (int)prompt_tokens.size() > n_ctx) {
+        owner_->clear_active_request();
         SetError("context size exceeded");
         return;
     }
@@ -135,7 +166,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // 1. Grammar — constrain logits before any probability filtering
     if (!grammar_str_.empty()) {
         llama_sampler_chain_add(smpl,
-            llama_sampler_init_grammar(vocab_, grammar_str_.c_str(), "root"));
+            llama_sampler_init_grammar(vocab, grammar_str_.c_str(), "root"));
     }
     // 2. Repeat penalty
     if (repeat_penalty_ != 1.0f && repeat_last_n_ != 0) {
@@ -187,35 +218,37 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     };
 
     while (true) {
-        if (cancel_.load(std::memory_order_relaxed)) {
+        if (state_->cancel.load(std::memory_order_relaxed)) {
             break;
         }
 
-        int ret = llama_decode(ctx_, batch);
+        int ret = llama_decode(ctx, batch);
         if (ret == 2) { break; } // aborted via abort_callback
         if (ret != 0) {
             llama_sampler_free(smpl);
+            owner_->clear_active_request();
             SetError(std::string("llama_decode failed, ret=") +
                      std::to_string(ret));
             return;
         }
 
         try {
-            new_token_id = llama_sampler_sample(smpl, ctx_, -1);
+            new_token_id = llama_sampler_sample(smpl, ctx, -1);
         } catch (const std::runtime_error &) {
             // Grammar fully satisfied — stacks are empty, no further tokens
             // can be accepted. Treat as a clean end-of-generation.
             break;
         }
 
-        if (llama_vocab_is_eog(vocab_, new_token_id)) {
+        if (llama_vocab_is_eog(vocab, new_token_id)) {
             break;
         }
 
         char buf[256];
-        int n = llama_token_to_piece(vocab_, new_token_id, buf, sizeof(buf), 0, true);
+        int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
         if (n < 0) {
             llama_sampler_free(smpl);
+            owner_->clear_active_request();
             SetError("llama_token_to_piece failed");
             return;
         }
@@ -275,6 +308,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     }
 
     llama_sampler_free(smpl);
+    owner_->clear_active_request();
 }
 
 void GenerateWorker::OnProgress(const TokenChunk * chunks, size_t count) {

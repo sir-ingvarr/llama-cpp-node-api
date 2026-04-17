@@ -78,13 +78,18 @@ function resolveGrammar(opts) {
     return { ...rest, grammar: fs.readFileSync(grammarFile, 'utf8') };
 }
 
+function makeAbortError(message = 'Aborted') {
+    const err = new Error(message);
+    err.name = 'AbortError';
+    return err;
+}
+
 // ---------------------------------------------------------------------------
 // LlamaModel
 // ---------------------------------------------------------------------------
 
 class LlamaModel {
     #native;
-    #generating = false;
 
     /**
      * @param {string} modelPath  Absolute path to the .gguf model file.
@@ -97,34 +102,49 @@ class LlamaModel {
     /**
      * Yields token strings as they are produced.
      *
+     * Concurrent calls are allowed: each call is queued behind any running or
+     * queued generations. Pass `opts.signal` (AbortSignal) to cancel an
+     * individual request; calling `model.abort()` cancels *all* tracked
+     * requests (current + queued).
+     *
+     * When `opts.signal` fires, the generator throws an `AbortError`.
+     *
      * @param {string} prompt
      * @param {import('./index').GenerateOptions} [opts]
      * @yields {string}
      */
     async * generate(prompt, opts = {}) {
-        if (this.#generating) {
-            throw new Error('Already generating — call abort() first or await the previous generator');
-        }
-        this.#generating = true;
-
         const ch = createChannel();
-        this.#native.generate(
+        const { signal, ...nativeOpts } = opts;
+
+        const reqId = this.#native.generate(
             prompt,
-            resolveGrammar(opts),
+            resolveGrammar(nativeOpts),
             buf => ch.push(buf.toString('utf8')),
             err => ch.close(err)
         );
 
+        let onAbort = null;
+        if (signal) {
+            if (signal.aborted) {
+                this.#native.abortRequest(reqId);
+            } else {
+                onAbort = () => this.#native.abortRequest(reqId);
+                signal.addEventListener('abort', onAbort, { once: true });
+            }
+        }
+
         try {
             for await (const token of ch) yield token;
         } finally {
-            this.#generating = false;
+            if (onAbort) signal.removeEventListener('abort', onAbort);
         }
 
         if (ch.error) throw ch.error;
+        if (signal?.aborted) throw makeAbortError();
     }
 
-    /** Signal the running generation to stop at the next token boundary. */
+    /** Cancel every currently running and queued generation on this model. */
     abort() { this.#native.abort(); }
 
     /** Release model weights and KV cache. */
@@ -250,5 +270,35 @@ class LlamaModelPool {
 }
 
 // ---------------------------------------------------------------------------
+// quantize — standalone GGUF requantization
+// ---------------------------------------------------------------------------
 
-module.exports = { LlamaModel, LlamaModelPool };
+/**
+ * Convert a GGUF file from one quantization to another.
+ * Runs on a libuv worker thread; returns a Promise that resolves when done.
+ *
+ * @param {string} inputPath    Source .gguf (typically F16 or F32).
+ * @param {string} outputPath   Destination .gguf.
+ * @param {import('./index').QuantizeOptions} opts
+ * @returns {Promise<void>}
+ */
+function quantize(inputPath, outputPath, opts) {
+    if (!opts || (typeof opts.ftype !== 'string' && typeof opts.ftype !== 'number')) {
+        return Promise.reject(new TypeError('quantize: opts.ftype is required (string name or enum value)'));
+    }
+    return new Promise((resolve, reject) => {
+        addon.quantize(inputPath, outputPath, opts, err => {
+            if (err) reject(err);
+            else     resolve();
+        });
+    });
+}
+
+/** List of ftype names accepted by `quantize()`. */
+function quantizeFtypes() {
+    return addon.quantizeFtypes();
+}
+
+// ---------------------------------------------------------------------------
+
+module.exports = { LlamaModel, LlamaModelPool, quantize, quantizeFtypes };

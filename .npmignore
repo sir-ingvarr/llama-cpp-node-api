@@ -3,7 +3,7 @@ npm/
 src/
 vendor/
 test/
-smoke.js
+*.js
 CLAUDE.md
 .github/
 .DS_Store
