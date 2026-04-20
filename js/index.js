@@ -168,6 +168,126 @@ class LlamaModel {
     }
 
     /**
+     * Jinja-based chat template renderer (libcommon). Supports tools,
+     * json_schema, and reasoning toggles, and returns the auto-generated
+     * GBNF grammar / stop sequences that constrain the model's output.
+     *
+     * Pass the returned `prompt` to `generate()`; if `grammar` is present,
+     * forward `grammar`, `grammarTriggerPatterns`, `grammarTriggerTokens`,
+     * `preservedTokens`, and merge `additionalStops` with your own stops.
+     * Use `format` with `common_chat_parse` (not exposed yet) or your own
+     * post-processor to recover tool calls from the generated text.
+     *
+     * @param {Array<object>} messages  OAI-format chat messages.
+     * @param {import('./index').ApplyChatTemplateJinjaOptions} [opts]
+     * @returns {import('./index').ChatTemplateJinjaResult}
+     */
+    applyChatTemplateJinja(messages, opts = {}) {
+        const {
+            tools,
+            toolChoice,
+            parallelToolCalls,
+            addGenerationPrompt,
+            enableThinking,
+            grammar,
+            jsonSchema,
+            chatTemplateKwargs,
+            chatTemplateOverride,
+        } = opts;
+
+        const nativeOpts = {};
+        if (toolChoice           !== undefined) nativeOpts.toolChoice           = toolChoice;
+        if (parallelToolCalls    !== undefined) nativeOpts.parallelToolCalls    = parallelToolCalls;
+        if (addGenerationPrompt  !== undefined) nativeOpts.addGenerationPrompt  = addGenerationPrompt;
+        if (enableThinking       !== undefined) nativeOpts.enableThinking       = enableThinking;
+        if (grammar              !== undefined) nativeOpts.grammar              = grammar;
+        if (chatTemplateKwargs   !== undefined) nativeOpts.chatTemplateKwargs   = chatTemplateKwargs;
+        if (chatTemplateOverride !== undefined) nativeOpts.chatTemplateOverride = chatTemplateOverride;
+        if (jsonSchema           !== undefined) {
+            nativeOpts.jsonSchema =
+                typeof jsonSchema === 'string' ? jsonSchema : JSON.stringify(jsonSchema);
+        }
+
+        return this.#native.applyChatTemplateJinja(
+            JSON.stringify(messages),
+            JSON.stringify(tools ?? []),
+            nativeOpts
+        );
+    }
+
+    /**
+     * Parse a model response back into a structured message. Expects `format`
+     * (and ideally `parser`) as returned by `applyChatTemplateJinja`.
+     * Works for all libcommon formats; for `format === 'legacy'` the text
+     * is returned as-is under `content`.
+     *
+     * @param {string} text
+     * @param {import('./index').ParseChatResponseOptions} opts
+     * @returns {import('./index').ParsedChatMessage}
+     */
+    parseChatResponse(text, opts) {
+        return this.#native.parseChatResponse(text, opts);
+    }
+
+    /**
+     * One-shot high-level chat: renders the template, runs generate with
+     * any auto-emitted grammar/triggers/stops, parses the output, and
+     * returns the structured message. Equivalent to
+     * `applyChatTemplateJinja` → `generate` → `parseChatResponse`.
+     *
+     * @param {import('./index').ChatOptions} opts
+     * @returns {Promise<import('./index').ChatResult>}
+     */
+    async chat(opts) {
+        const { messages, tools, toolChoice, parallelToolCalls,
+                enableThinking, jsonSchema, chatTemplateKwargs,
+                chatTemplateOverride, signal, stop,
+                ...generateOpts } = opts;
+
+        const rendered = this.applyChatTemplateJinja(messages, {
+            tools, toolChoice, parallelToolCalls, enableThinking,
+            jsonSchema, chatTemplateKwargs, chatTemplateOverride,
+            addGenerationPrompt: true,
+        });
+
+        const mergedStops = [
+            ...(stop ?? []),
+            ...(rendered.additionalStops ?? []),
+        ];
+
+        const genOpts = {
+            ...generateOpts,
+            signal,
+            stop: mergedStops.length ? mergedStops : undefined,
+        };
+        if (rendered.grammar) {
+            genOpts.grammar = rendered.grammar;
+            if (rendered.grammarTriggerPatterns) genOpts.grammarTriggerPatterns = rendered.grammarTriggerPatterns;
+            if (rendered.grammarTriggerTokens)   genOpts.grammarTriggerTokens   = rendered.grammarTriggerTokens;
+            if (rendered.preservedTokens)        genOpts.preservedTokens        = rendered.preservedTokens;
+        }
+
+        let text = '';
+        for await (const tok of this.generate(rendered.prompt, genOpts)) {
+            text += tok;
+        }
+
+        const parsed = this.parseChatResponse(text, {
+            format: rendered.format,
+            parser: rendered.parser,
+            generationPrompt: rendered.generationPrompt,
+        });
+
+        return {
+            content:          parsed.content,
+            reasoningContent: parsed.reasoningContent,
+            toolCalls:        parsed.toolCalls,
+            format:           rendered.format,
+            raw:              text,
+        };
+    }
+
+    /**
      * Convert text to token IDs.
      *
      * @param {string} text
@@ -246,8 +366,8 @@ class LlamaModelPool {
     }
 
     /**
-     * Unload a single model, freeing its native resources.
-     * The registration is kept; the model reloads automatically on next use.
+     * Dispose a model and remove it from the pool. The `name` is released —
+     * re-register it explicitly if you want to load it again.
      * @param {string} name
      */
     unload(name) {

@@ -64,7 +64,7 @@ if(LLAMA_NODE_VENDOR)
     set(LLAMA_BUILD_TOOLS    OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
-    set(LLAMA_BUILD_COMMON   OFF CACHE BOOL "" FORCE)
+    set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
     set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
     # Disable host-native CPU flags: cmake-js may cross-compile (e.g. x86_64
@@ -82,6 +82,7 @@ add_library(llama_node SHARED
     src/llama_model.cpp
     src/generate_worker.cpp
     src/quantize_worker.cpp
+    src/chat_templates.cpp
 )
 
 set_target_properties(llama_node PROPERTIES
@@ -103,20 +104,33 @@ if(LLAMA_ROOT)
         HINTS "${LLAMA_ROOT}/build/bin" "${LLAMA_ROOT}/build"
         NO_DEFAULT_PATH
     )
+    find_library(LLAMA_COMMON_LIBRARY
+        NAMES llama-common common
+        REQUIRED
+        HINTS "${LLAMA_ROOT}/build/common" "${LLAMA_ROOT}/build/bin" "${LLAMA_ROOT}/build"
+        NO_DEFAULT_PATH
+    )
     message(STATUS "llama-node: using pre-built llama at ${LLAMA_LIBRARY}")
+    message(STATUS "llama-node: using pre-built common at ${LLAMA_COMMON_LIBRARY}")
     target_include_directories(llama_node PRIVATE
         ${LLAMA_ROOT}/include
         ${LLAMA_ROOT}/ggml/include
+        ${LLAMA_ROOT}/common
+        ${LLAMA_ROOT}/vendor
     )
     target_link_libraries(llama_node PRIVATE
+        ${LLAMA_COMMON_LIBRARY}
         ${LLAMA_LIBRARY}
         ${CMAKE_JS_LIB}
     )
 else()
     # Vendor submodule or parent-scope target: llama target already defined,
-    # its PUBLIC include dirs propagate transitively.
+    # its PUBLIC include dirs propagate transitively. `llama-common` brings
+    # the Jinja chat templates + OAI-compat parsers used by
+    # applyChatTemplateJinja.
     target_link_libraries(llama_node PRIVATE
         llama
+        llama-common
         ${CMAKE_JS_LIB}
     )
 endif()

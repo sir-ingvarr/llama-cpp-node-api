@@ -17,12 +17,19 @@
 3. [JavaScript API](#3-javascript-api)
    - 3.1 [`new LlamaModel(modelPath, opts?)`](#31-new-llamamodelmodelpath-opts)
    - 3.2 [`model.generate(prompt, opts?)`](#32-modelgenerateprompt-opts)
-   - 3.3 [`model.abort()`](#33-modelabort)
+   - 3.3 [Cancellation: `model.abort()` and `opts.signal`](#33-cancellation)
    - 3.4 [`model.dispose()`](#34-modeldispose)
-   - 3.5 [`model.contextLength`](#35-modelcontextlength)
-   - 3.6 [Explicit resource management (`using`)](#36-explicit-resource-management-using)
-   - 3.7 [Error handling](#37-error-handling)
-   - 3.8 [Full usage examples](#38-full-usage-examples)
+   - 3.5 [Model introspection: `contextLength`, `chatTemplate`, `getModelInfo`](#35-model-introspection)
+   - 3.6 [Tokenization: `model.tokenize`, `model.detokenize`](#36-tokenization)
+   - 3.7 [`model.applyChatTemplate(messages, opts?)` (legacy)](#37-modelapplychattemplatemessages-opts-legacy)
+   - 3.8 [`model.applyChatTemplateJinja(messages, opts?)`](#38-modelapplychattemplatejinjamessages-opts)
+   - 3.9 [`model.parseChatResponse(text, opts)`](#39-modelparsechatresponsetext-opts)
+   - 3.10 [`model.chat(opts)`](#310-modelchatopts)
+   - 3.11 [`LlamaModelPool`](#311-llamamodelpool)
+   - 3.12 [`quantize` / `quantizeFtypes`](#312-quantize--quantizeftypes)
+   - 3.13 [Explicit resource management (`using`)](#313-explicit-resource-management-using)
+   - 3.14 [Error handling](#314-error-handling)
+   - 3.15 [Full usage examples](#315-full-usage-examples)
 
 ---
 
@@ -319,6 +326,16 @@ generate(prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, u
 | `opts.topK` | `number` | `40` | Only the top-k most probable tokens are kept before sampling. `0` disables top-k filtering. |
 | `opts.nCtx` | `number` | model default | Override the context window size for this call. If different from the current context size, the context is recreated (KV cache is lost). |
 | `opts.resetContext` | `boolean` | `false` | When `true`, the KV cache is cleared before generation begins, starting a fresh conversation. When `false`, previous context (prior turns) is retained and the new prompt is appended. |
+| `opts.minP` | `number` | `0` | Min-p sampling: removes tokens whose probability is below `minP * p(top)`. Typical values 0.05–0.1. `0` disables. |
+| `opts.repeatPenalty` | `number` | `1.0` | Penalty applied to recently generated tokens. `> 1` discourages repetition (e.g. `1.1`). `1.0` disables. |
+| `opts.repeatLastN` | `number` | `64` | How many most-recent tokens the repeat penalty considers. `0` disables the penalty entirely. |
+| `opts.grammar` | `string` | — | GBNF grammar constraining output. Takes precedence over `grammarFile`. |
+| `opts.grammarFile` | `string` | — | Path to a `.gbnf` file; read synchronously and used as `grammar`. |
+| `opts.stop` | `string[]` | `[]` | Stop sequences. Generation halts as soon as any of these strings appears; the stop string itself is not yielded. |
+| `opts.signal` | `AbortSignal` | — | Cancels this specific generation when fired. Throws `AbortError` from the generator. Unlike `model.abort()`, other concurrent generations are unaffected. |
+| `opts.grammarTriggerPatterns` | `string[]` | — | Lazy-grammar regex triggers. When set (and `grammar` is also set), the grammar stays inactive until one of these patterns appears in the output, then activates for the remainder. Used for tool calls where the model writes prose first. |
+| `opts.grammarTriggerTokens` | `number[]` | — | Lazy-grammar vocab-token triggers. Same semantics as `grammarTriggerPatterns` but matches specific token IDs. |
+| `opts.preservedTokens` | `string[]` | — | Tokens that must be preserved as atomic units during sampling (e.g. `<tool_call>`, `<|channel|>`). Reserved for future sampler integration; currently passed through. |
 
 **Return value**
 
@@ -326,9 +343,9 @@ An `AsyncGenerator<string>` that yields token text pieces (one or more character
 
 **Constraints**
 
-- Only **one** generation can run at a time per model instance. Calling `generate()` while another generator is active throws `Error: Already generating — call abort() first`.
+- Concurrent `generate()` calls on the same model instance are supported — each call returns its own independent async generator. Calls queue internally and serialise on the context mutex; only one runs `llama_decode` at a time, but the JS side sees them as fully parallel.
 - `generate()` runs `llama_decode` on a libuv worker thread; the JS event loop is not blocked between `yield` points.
-- The prompt is passed directly to the tokenizer. It must already include all special tokens and chat markers required by the model.
+- The prompt is passed directly to the tokenizer. It must already include all special tokens and chat markers required by the model. Use `applyChatTemplate()` or `applyChatTemplateJinja()` (§3.9) to render from chat messages.
 
 ```js
 for await (const token of model.generate(prompt, { nPredict: 512, temperature: 0.7 })) {
@@ -352,26 +369,45 @@ When the accumulated context approaches `nCtx` tokens, generation will fail with
 
 ---
 
-### 3.3 `model.abort()`
+### 3.3 Cancellation
+
+There are two cancellation mechanisms, covering different scopes.
+
+#### `model.abort()`
 
 ```ts
 abort(): void
 ```
 
-Signals the currently running generation to stop at the next token boundary. Returns immediately; the generator's `for await` loop will end after the in-flight token (if any) is yielded.
-
-- Safe to call even if no generation is in progress (no-op).
-- After calling `abort()`, the same model instance can be used for a new `generate()` call immediately — the `generating` flag is cleared when the generator finishes iterating.
+Signals **every** currently running and queued generation on this model to stop at the next token boundary. Returns immediately; each generator's `for await` loop ends after the in-flight token (if any) is yielded. Safe to call even with no generations in flight (no-op).
 
 ```js
 const gen = model.generate(longPrompt, { nPredict: -1 });
 setTimeout(() => model.abort(), 3000);
 
-for await (const token of gen) {
-    process.stdout.write(token);
-}
-// Loop exits after ~3 seconds
+for await (const token of gen) process.stdout.write(token);
+// loop exits after ~3 seconds
 ```
+
+#### Per-request `AbortSignal`
+
+Pass `opts.signal` to `generate()` to cancel *just that call* — other concurrent generations on the same model continue running. When the signal fires the generator throws `AbortError` from its next iteration.
+
+```js
+const ac = new AbortController();
+setTimeout(() => ac.abort(), 3000);
+
+try {
+    for await (const t of model.generate(prompt, { signal: ac.signal })) {
+        process.stdout.write(t);
+    }
+} catch (err) {
+    if (err.name === 'AbortError') console.log('\n[aborted]');
+    else throw err;
+}
+```
+
+Both mechanisms are lock-free — aborts take effect inside `llama_decode` via an atomic flag read, not by acquiring any mutex.
 
 ---
 
@@ -398,29 +434,359 @@ try {
 
 ---
 
-### 3.5 `model.contextLength`
+### 3.5 Model introspection
+
+#### `model.contextLength`
 
 ```ts
 readonly contextLength: number
 ```
 
-Returns the number of token slots available in the current `llama_context`. Returns `0` if no context has been created yet (before the first `generate()` call).
-
-This reflects the configured `nCtx` value, not the number of tokens currently consumed.
+Number of token slots in the current `llama_context`. Returns `0` before the first `generate()` call (context is created lazily). Reflects the configured `nCtx` value, not the tokens currently consumed.
 
 ```js
 console.log(model.contextLength); // 0 before first generate()
-
 for await (const t of model.generate('Hello', { nCtx: 4096 })) {}
-
 console.log(model.contextLength); // 4096
+```
+
+#### `model.chatTemplate`
+
+```ts
+readonly chatTemplate: string | null
+```
+
+The Jinja2 chat template embedded in the GGUF metadata, or `null` if the file has no template. Note that some older GGUFs store a legacy template *alias* (e.g. the literal string `mistral-v7-tekken`) here rather than real Jinja source — see §3.8 for how `applyChatTemplateJinja` handles that case.
+
+```js
+if (model.chatTemplate) {
+    console.log('Template length:', model.chatTemplate.length);
+}
+```
+
+#### `model.getModelInfo()`
+
+```ts
+getModelInfo(): ModelInfo
+```
+
+Returns a snapshot of model metadata: description, parameter count, disk size, trained context length, layer count, vocabulary size, and the special-token IDs (BOS/EOS/EOT).
+
+```ts
+interface ModelInfo {
+    description: string;         // e.g. "llama 8B Q4_0"
+    nParams: number;
+    modelSize: number;           // bytes on disk
+    trainContextLength: number;
+    embeddingSize: number;
+    nLayer: number;
+    vocabSize: number;
+    specialTokens: { bos: number; eos: number; eot: number };
+}
+```
+
+```js
+const info = model.getModelInfo();
+console.log(`${info.description}, ${(info.nParams / 1e9).toFixed(1)}B params`);
 ```
 
 ---
 
-### 3.6 Explicit resource management (`using`)
+### 3.6 Tokenization
 
-`LlamaModel` implements the TC39 [Explicit Resource Management](https://github.com/tc39/proposal-explicit-resource-management) protocol via `Symbol.dispose`. In environments that support the `using` keyword (TypeScript 5.2+, Node.js 22+ with `--experimental-vm-modules` or transpilation):
+Cheap helpers that route directly to llama.cpp's tokenizer — useful for counting prompt tokens before generation, or for inspecting how the model segments text.
+
+#### `model.tokenize(text, opts?)`
+
+```ts
+tokenize(text: string, opts?: TokenizeOptions): number[]
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `addSpecial` | `boolean` | `true` | Prepend BOS / append EOS when the tokenizer requests them. |
+| `parseSpecial` | `boolean` | `false` | Parse special-token syntax (e.g. `<\|im_start\|>`) instead of treating it as literal text. |
+
+```js
+const ids = model.tokenize('Hello, world!');
+console.log(ids.length, 'tokens');
+```
+
+#### `model.detokenize(tokens, opts?)`
+
+```ts
+detokenize(tokens: number[], opts?: DetokenizeOptions): string
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `removeSpecial` | `boolean` | `false` | Skip special tokens in the output. |
+| `unparseSpecial` | `boolean` | `false` | Render special tokens as their textual form instead of the bytes they represent. |
+
+```js
+const text = model.detokenize(ids);
+```
+
+---
+
+### 3.7 `model.applyChatTemplate(messages, opts?)` (legacy)
+
+Wraps llama.cpp's built-in template renderer (`llama_chat_apply_template`). This path does **not** use a Jinja parser — it matches a hardcoded list of known template shapes by name/header and only supports plain `{ role, content }` messages. Use it when:
+
+- You need maximum compatibility with older GGUFs that store template aliases.
+- You don't need tools / JSON schema / reasoning / template kwargs. For any of those, use `applyChatTemplateJinja` (§3.8).
+
+```ts
+applyChatTemplate(messages: ChatMessage[], opts?: { addAssistant?: boolean }): string
+```
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `addAssistant` | `boolean` | `true` | Append the assistant-turn prefix so the model can continue from there. |
+
+Throws when the embedded template can't be resolved by the legacy path.
+
+```js
+const prompt = model.applyChatTemplate([
+    { role: 'system', content: 'You are helpful.' },
+    { role: 'user',   content: 'Hello!' }
+]);
+
+for await (const t of model.generate(prompt)) process.stdout.write(t);
+```
+
+---
+
+### 3.8 `model.applyChatTemplateJinja(messages, opts?)`
+
+Renders chat messages through libcommon's Jinja template engine, returning the prompt *plus* any auto-generated grammar, lazy-grammar triggers, parser blob, and stop sequences the template family requires. Use this instead of `applyChatTemplate` when you want tool-calling, `json_schema` constraints, or reasoning toggles.
+
+```ts
+applyChatTemplateJinja(
+    messages: Array<ChatMessage | object>,
+    opts?: ApplyChatTemplateJinjaOptions
+): ChatTemplateJinjaResult
+```
+
+**Options**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `tools` | `ChatTemplateTool[]` | — | OpenAI-format tool definitions (`{ type: 'function', function: { name, description, parameters } }`; the flat form `{ name, description, parameters }` is also accepted). |
+| `toolChoice` | `'auto' \| 'required' \| 'none'` | `'auto'` | How strongly the template should push the model toward a tool call. |
+| `parallelToolCalls` | `boolean` | `false` | Allow multiple tool calls in one turn. |
+| `addGenerationPrompt` | `boolean` | `true` | Append the assistant-turn prefix. |
+| `enableThinking` | `boolean` | `true` | Enable `<think>`/reasoning blocks when supported. |
+| `grammar` | `string` | — | Raw GBNF grammar used when `tools` and `jsonSchema` are absent. Ignored when either is present (libcommon replaces it with the auto-generated tool/schema grammar). |
+| `jsonSchema` | `string \| object` | — | JSON schema constraining free-form output. |
+| `chatTemplateKwargs` | `Record<string, string>` | — | Arbitrary Jinja variables as JSON strings (e.g. `{ enable_thinking: 'true' }`). |
+| `chatTemplateOverride` | `string` | — | Full Jinja template source used in place of the model's embedded template. Useful when the GGUF stores only a legacy alias (`mistral-v7-tekken`, etc.) — paste the template from the model's HuggingFace `tokenizer_config.json`. |
+
+**Return value**
+
+```ts
+interface ChatTemplateJinjaResult {
+    prompt: string;                    // rendered prompt, feed to generate()
+    format: string;                    // 'Content-only' | 'peg-simple' | 'peg-native' | 'peg-gemma4' | 'legacy'
+    parser?: string;                   // opaque PEG arena blob; pass to parseChatResponse()
+    generationPrompt?: string;
+    grammar?: string;                  // auto-generated; undefined when the format uses PEG-only parsing
+    grammarLazy?: boolean;
+    grammarTriggerPatterns?: string[];
+    grammarTriggerTokens?: number[];
+    preservedTokens?: string[];
+    additionalStops?: string[];        // merge into generate()'s `stop` array
+}
+```
+
+**Auto-fallback for alias templates.** Some GGUFs store a legacy template *name* (e.g. the literal string `mistral-v7-tekken`) instead of Jinja source. `applyChatTemplateJinja` detects this and falls back to `llama_chat_apply_template()` (the legacy C API that resolves aliases), returning `{ prompt, format: 'legacy' }`. If `tools` or `jsonSchema` were supplied, it throws — the legacy path can't honour them. Use `chatTemplateOverride` to supply full Jinja source when you need tools with such a model.
+
+```js
+// Content-only usage
+const { prompt } = model.applyChatTemplateJinja([
+    { role: 'system', content: 'You are a terse assistant.' },
+    { role: 'user',   content: 'Name three primary colors.' }
+]);
+for await (const t of model.generate(prompt, { nPredict: 64 })) process.stdout.write(t);
+
+// With tools — see §3.15 for the full end-to-end flow
+const rendered = model.applyChatTemplateJinja(messages, {
+    tools: [weatherTool], toolChoice: 'auto'
+});
+```
+
+---
+
+### 3.9 `model.parseChatResponse(text, opts)`
+
+Parses a raw model response back into a structured message. Uses the `format` (and `parser`) tags from `applyChatTemplateJinja` to dispatch to the right per-format parser.
+
+```ts
+parseChatResponse(text: string, opts: ParseChatResponseOptions): ParsedChatMessage
+```
+
+**Options**
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `format` | `string` | Required. One of the values emitted by `applyChatTemplateJinja.format`. |
+| `parser` | `string` | Opaque PEG blob from `applyChatTemplateJinja.parser`. Pass through unchanged. |
+| `generationPrompt` | `string` | Pass through `applyChatTemplateJinja.generationPrompt` when present. |
+| `parseToolCalls` | `boolean` | Extract tool calls. Default `true`. |
+| `isPartial` | `boolean` | Set when `text` is a streaming partial; enables best-effort recovery. |
+
+**Return value**
+
+```ts
+interface ParsedChatMessage {
+    content: string;
+    reasoningContent: string;
+    toolCalls: Array<{ name: string; arguments: string; id: string }>;
+    toolName?: string;       // only on tool-result messages
+    toolCallId?: string;
+}
+```
+
+`arguments` is a JSON string — parse with `JSON.parse` when you need the actual argument object. For `format === 'legacy'` the method returns the text verbatim as `content` (no parser available).
+
+---
+
+### 3.10 `model.chat(opts)`
+
+One-shot helper that bundles `applyChatTemplateJinja` → `generate` → `parseChatResponse`. Buffers the full output internally and returns a structured result — it does **not** stream. For streaming, use `generate()` directly (and call `parseChatResponse` on the collected text). See §3.15 for both flows side-by-side.
+
+```ts
+chat(opts: ChatOptions): Promise<ChatResult>
+```
+
+**Options**
+
+Takes everything from `GenerateOptions` (except `grammar` / `grammarTriggerPatterns` / `grammarTriggerTokens` / `preservedTokens` — those are derived from the template) plus:
+
+| Option | Type | Description |
+|--------|------|-------------|
+| `messages` | `Array<ChatMessage>` | Required. Chat history. |
+| `tools` | `ChatTemplateTool[]` | OpenAI-format tool definitions. |
+| `toolChoice`, `parallelToolCalls`, `enableThinking`, `jsonSchema`, `chatTemplateKwargs`, `chatTemplateOverride` | — | Same as `applyChatTemplateJinja`. |
+| `stop` | `string[]` | Merged with the template's `additionalStops`. |
+| `signal` | `AbortSignal` | Forwarded to `generate()`. |
+
+**Return value**
+
+```ts
+interface ChatResult {
+    content: string;
+    reasoningContent: string;
+    toolCalls: Array<{ name: string; arguments: string; id: string }>;
+    format: string;
+    raw: string;              // full generated text, before parsing
+}
+```
+
+```js
+const result = await model.chat({
+    messages: [{ role: 'user', content: "What's the weather in Paris?" }],
+    tools: [weatherTool],
+    nPredict: 200,
+});
+
+if (result.toolCalls.length) {
+    for (const call of result.toolCalls) {
+        const args = JSON.parse(call.arguments);
+        const output = await runTool(call.name, args);
+        // feed `output` back into a follow-up chat() call as a tool-role message
+    }
+} else {
+    console.log(result.content);
+}
+```
+
+---
+
+### 3.11 `LlamaModelPool`
+
+Registry that lazy-loads named models. Useful when you want to declare a set of available models up-front but only pay the load cost on first use. Not a worker pool — a single pool does **not** run concurrent models in parallel native threads; concurrency still happens within each `LlamaModel` instance (see §3.2).
+
+```ts
+class LlamaModelPool {
+    register(name: string, modelPath: string, opts?: LlamaModelOptions): void;
+    load(name: string): LlamaModel;
+    generate(name: string, prompt: string, opts?: GenerateOptions): AsyncGenerator<string>;
+    unload(name: string): void;
+    dispose(): void;
+    readonly chatTemplate: string | null;    // from the first loaded model, or null
+    [Symbol.dispose](): void;                // same as dispose()
+}
+```
+
+- `register(name, path, opts)` — record a model under `name`. Throws if `name` is already registered. Does **not** load the file yet.
+- `load(name)` — return the live `LlamaModel` for `name`, constructing it on first call.
+- `generate(name, prompt, opts)` — shorthand for `pool.load(name).generate(prompt, opts)`.
+- `unload(name)` — dispose the underlying `LlamaModel` and **remove** its registration from the pool. Unlike some pool implementations, the name is not retained for auto-reload; re-register it explicitly if you want it back.
+- `dispose()` — dispose every loaded model and clear the registry.
+
+```js
+const { LlamaModelPool } = require('llama-node');
+
+const pool = new LlamaModelPool();
+pool.register('chat',  '/models/llama-3.1-8b.gguf',  { nCtx: 4096 });
+pool.register('coder', '/models/qwen2.5-coder.gguf', { nCtx: 8192 });
+
+for await (const t of pool.generate('coder', 'function fizzBuzz() {')) {
+    process.stdout.write(t);
+}
+
+pool.dispose();
+```
+
+---
+
+### 3.12 `quantize` / `quantizeFtypes`
+
+Module-level function that converts a GGUF file from one quantization to another, wrapping `llama_model_quantize`. **GGUF → GGUF only** — converting from Safetensors / HF format requires llama.cpp's `convert_hf_to_gguf.py` (a Python tool with ~1.5 GB of deps), which this package deliberately does **not** bundle.
+
+```ts
+function quantize(
+    inputPath: string,
+    outputPath: string,
+    opts: QuantizeOptions
+): Promise<void>;
+
+function quantizeFtypes(): QuantizeFtype[];
+```
+
+**QuantizeOptions**
+
+| Option | Type | Default | Description |
+|--------|------|---------|-------------|
+| `ftype` | `QuantizeFtype \| number` | required | Target format. Accepts a name (`'Q4_K_M'`, `'Q5_0'`, …) or the raw enum value. Use `quantizeFtypes()` for the full name list. |
+| `nthread` | `number` | `hw concurrency` | Number of threads used for the conversion. |
+| `allowRequantize` | `boolean` | `false` | Permit re-quantizing tensors that are not f32/f16 (e.g. re-quantizing an already-quantized file). |
+| `quantizeOutputTensor` | `boolean` | `true` | Also quantize `output.weight`. |
+| `onlyCopy` | `boolean` | `false` | Skip quantization — copy tensors verbatim. Useful for shard repacking. |
+| `pure` | `boolean` | `false` | Use the default ftype for every tensor (no per-tensor overrides). |
+| `keepSplit` | `boolean` | `false` | Preserve the input's shard count. |
+| `dryRun` | `boolean` | `false` | Compute + report final size without writing the output. |
+
+Runs on a libuv worker thread; the returned Promise resolves once the output has been written.
+
+```js
+const { quantize, quantizeFtypes } = require('llama-node');
+
+console.log('Supported ftypes:', quantizeFtypes().join(', '));
+
+await quantize(
+    '/models/llama-3-8b-f16.gguf',
+    '/models/llama-3-8b-q4_k_m.gguf',
+    { ftype: 'Q4_K_M', nthread: 8 }
+);
+```
+
+---
+
+### 3.13 Explicit resource management (`using`)
+
+Both `LlamaModel` and `LlamaModelPool` implement the TC39 [Explicit Resource Management](https://github.com/tc39/proposal-explicit-resource-management) protocol via `Symbol.dispose`. In environments that support the `using` keyword (TypeScript 5.2+, Node.js 22+ with `--experimental-vm-modules` or transpilation):
 
 ```ts
 {
@@ -428,25 +794,39 @@ console.log(model.contextLength); // 4096
     for await (const token of model.generate(prompt)) {
         process.stdout.write(token);
     }
-} // model.dispose() is called automatically here
+} // model.dispose() runs automatically here
+```
+
+```ts
+{
+    using pool = new LlamaModelPool();
+    pool.register('chat', '/models/model.gguf');
+    for await (const t of pool.generate('chat', prompt)) process.stdout.write(t);
+} // pool.dispose() runs automatically here
 ```
 
 ---
 
-### 3.7 Error handling
+### 3.14 Error handling
 
 All errors are thrown as standard JS `Error` objects.
 
-| Scenario | Error message |
-|----------|---------------|
+| Scenario | Error name / message |
+|----------|---------------------|
 | Model file not found or invalid | `"Failed to load model: <path>"` |
-| `generate()` called while generating | `"Already generating — call abort() first or await the previous generator"` |
-| `generate()` called after `dispose()` | `"LlamaModel has been disposed"` |
+| Method called after `dispose()` | `"LlamaModel has been disposed"` |
+| `generate()` cancelled via `opts.signal` | `AbortError: Aborted` |
 | Prompt too long for context | `"context size exceeded"` |
 | Context creation failed | `"Failed to create llama_context"` |
 | Internal decode error | `"llama_decode failed, ret=<N>"` |
+| `applyChatTemplate` on unsupported template | `"Failed to apply chat template — template may be unsupported"` |
+| `applyChatTemplateJinja` with tools on alias template | `"applyChatTemplateJinja: model's embedded template is a legacy alias; tools / jsonSchema cannot be honoured on this path. ..."` |
+| Invalid `format` passed to `parseChatResponse` | `"Unknown chat format name: <name>"` |
+| Pool: unknown name | `"LlamaModelPool: unknown model '<name>'"` |
+| Pool: duplicate registration | `"LlamaModelPool: '<name>' is already registered"` |
+| `quantize` missing or invalid `ftype` | `TypeError: "quantize: opts.ftype is required (string name or enum value)"` |
 
-Errors from the worker thread (tokenization, decode) are surfaced as a rejection of the async generator's final `next()` call — i.e. they are thrown inside the `for await` loop.
+Errors from the worker thread (tokenization, decode, quantization) surface as a rejection of the async generator's next call (for `generate`) or as a Promise rejection (for `quantize`). Wrap `for await` in try/catch to intercept them.
 
 ```js
 try {
@@ -454,13 +834,14 @@ try {
         process.stdout.write(token);
     }
 } catch (err) {
-    console.error('Generation failed:', err.message);
+    if (err.name === 'AbortError') console.log('[aborted]');
+    else console.error('Generation failed:', err.message);
 }
 ```
 
 ---
 
-### 3.8 Full usage examples
+### 3.15 Full usage examples
 
 #### Simple completion
 
@@ -472,10 +853,9 @@ const model = new LlamaModel('/models/llama-3-8b-q4_k_m.gguf', {
     nCtx: 4096,
 });
 
-const prompt = `<|begin_of_text|><|start_header_id|>user<|end_header_id|>
-Explain async generators in JavaScript.<|eot_id|>
-<|start_header_id|>assistant<|end_header_id|>
-`;
+const prompt = model.applyChatTemplateJinja([
+    { role: 'user', content: 'Explain async generators in JavaScript.' }
+]).prompt;
 
 process.stdout.write('Response: ');
 for await (const token of model.generate(prompt, { nPredict: 512, temperature: 0.7 })) {
@@ -527,42 +907,155 @@ http.createServer(async (req, res) => {
 #### Multi-turn conversation
 
 ```js
-let history = '';
+const messages = [
+    { role: 'system', content: 'You are a concise assistant.' }
+];
 
-async function chat(model, userMessage) {
-    // Build prompt from accumulated history
-    history += `[INST] ${userMessage} [/INST]`;
-
-    const parts = [];
-    for await (const token of model.generate(history, {
-        nPredict: 512,
-        resetContext: false,  // keep KV cache from previous turns
-    })) {
-        parts.push(token);
-    }
-
-    const reply = parts.join('');
-    history += reply;   // append model reply for next turn
-    return reply;
+async function turn(userMessage) {
+    messages.push({ role: 'user', content: userMessage });
+    const result = await model.chat({ messages, nPredict: 512 });
+    messages.push({ role: 'assistant', content: result.content });
+    return result.content;
 }
 
-console.log(await chat(model, 'Hello!'));
-console.log(await chat(model, 'What did I just say?'));
+console.log(await turn('Hello!'));
+console.log(await turn('What did I just say?'));
 ```
 
-#### Abort with a timeout
+#### Abort with a timeout (per-request)
 
 ```js
 async function generateWithTimeout(model, prompt, ms) {
-    const timer = setTimeout(() => model.abort(), ms);
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), ms);
     const parts = [];
     try {
-        for await (const token of model.generate(prompt, { nPredict: -1 })) {
+        for await (const token of model.generate(prompt, { nPredict: -1, signal: ac.signal })) {
             parts.push(token);
         }
+    } catch (err) {
+        if (err.name !== 'AbortError') throw err;
     } finally {
         clearTimeout(timer);
     }
     return parts.join('');
 }
 ```
+
+#### Tool calling: end-to-end
+
+Full round-trip render → generate → parse → execute → follow-up. Works with any tool-trained model whose GGUF has a Jinja tools template (Llama 3.1+, Qwen 2.5/3, Hermes, Functionary, Mistral Nemo Instruct, etc.).
+
+```js
+const { LlamaModel } = require('llama-node');
+
+const model = new LlamaModel('/models/llama-3.1-8b-instruct-q4_k_m.gguf', {
+    nGpuLayers: 99,
+    nCtx: 4096,
+});
+
+const weatherTool = {
+    type: 'function',
+    function: {
+        name: 'get_weather',
+        description: 'Get the current weather for a city.',
+        parameters: {
+            type: 'object',
+            properties: {
+                city: { type: 'string' },
+                units: { type: 'string', enum: ['c', 'f'], default: 'c' }
+            },
+            required: ['city'],
+        }
+    }
+};
+
+async function runTool(name, args) {
+    if (name === 'get_weather') {
+        // ...your real implementation here...
+        return { temperature: 14, conditions: 'cloudy', units: args.units ?? 'c' };
+    }
+    throw new Error(`Unknown tool: ${name}`);
+}
+
+async function converse(messages) {
+    // 1. First turn — the model may respond with content or a tool call.
+    const first = await model.chat({
+        messages,
+        tools: [weatherTool],
+        nPredict: 512,
+        temperature: 0.3,
+    });
+
+    // Plain content response — we're done.
+    if (first.toolCalls.length === 0) {
+        return first.content;
+    }
+
+    // 2. Execute each tool call and append results to the conversation.
+    const followUp = [...messages];
+    followUp.push({
+        role: 'assistant',
+        content: first.content,
+        tool_calls: first.toolCalls.map(c => ({
+            id: c.id || `call_${Math.random().toString(36).slice(2, 10)}`,
+            type: 'function',
+            function: { name: c.name, arguments: c.arguments },
+        })),
+    });
+    for (const call of first.toolCalls) {
+        const args = JSON.parse(call.arguments);
+        const output = await runTool(call.name, args);
+        followUp.push({
+            role: 'tool',
+            tool_call_id: call.id,
+            content: JSON.stringify(output),
+        });
+    }
+
+    // 3. Second turn — model synthesises a natural-language reply from the tool results.
+    const final = await model.chat({
+        messages: followUp,
+        tools: [weatherTool],
+        nPredict: 512,
+        temperature: 0.3,
+    });
+    return final.content;
+}
+
+const answer = await converse([
+    { role: 'user', content: "What's the weather like in Paris today?" }
+]);
+console.log(answer);
+model.dispose();
+```
+
+**Streaming variant.** `chat()` buffers the full output. If you need to stream tokens to a UI while the model is thinking, drop to the raw primitives:
+
+```js
+const rendered = model.applyChatTemplateJinja(messages, { tools });
+
+let raw = '';
+for await (const tok of model.generate(rendered.prompt, {
+    grammar:                rendered.grammar,
+    grammarTriggerPatterns: rendered.grammarTriggerPatterns,
+    grammarTriggerTokens:   rendered.grammarTriggerTokens,
+    preservedTokens:        rendered.preservedTokens,
+    stop:                   rendered.additionalStops,
+    nPredict:               512,
+})) {
+    process.stdout.write(tok);     // stream to UI
+    raw += tok;
+}
+
+const parsed = model.parseChatResponse(raw, {
+    format:           rendered.format,
+    parser:           rendered.parser,
+    generationPrompt: rendered.generationPrompt,
+});
+// parsed.toolCalls, parsed.content, parsed.reasoningContent
+```
+
+**Which models emit an auto-grammar.** libcommon tags each format with one of: `Content-only`, `peg-simple`, `peg-native`, `peg-gemma4`, or `legacy` (our fallback). Hermes/Qwen-style formats return a full `grammar` + `grammarTriggerPatterns` that constrains tool-call output at sample time. Llama 3.x and Gemma-style formats use the PEG parser post-hoc — `grammar` is undefined but `parseChatResponse` still recovers the tool calls from free-form output. Either way, the flow above works; you just don't need to forward grammar fields that are absent.
+
+---

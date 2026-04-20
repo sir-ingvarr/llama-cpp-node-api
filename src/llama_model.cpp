@@ -1,6 +1,8 @@
 #include "llama_model.h"
 #include "generate_worker.h"
 
+#include "chat.h"  // libcommon: common_chat_templates_free
+
 #include <string>
 #include <utility>
 #include <vector>
@@ -18,6 +20,8 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
         InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
         InstanceMethod<&LlamaModel::ApplyChatTemplate>("applyChatTemplate"),
+        InstanceMethod<&LlamaModel::ApplyChatTemplateJinja>("applyChatTemplateJinja"),
+        InstanceMethod<&LlamaModel::ParseChatResponse>("parseChatResponse"),
         InstanceMethod<&LlamaModel::Tokenize>("tokenize"),
         InstanceMethod<&LlamaModel::Detokenize>("detokenize"),
         InstanceMethod<&LlamaModel::GetModelInfo>("getModelInfo"),
@@ -93,6 +97,10 @@ LlamaModel::~LlamaModel() {
             llama_model_free(model_);
             model_ = nullptr;
         }
+    }
+    if (chat_templates_) {
+        common_chat_templates_free(chat_templates_);
+        chat_templates_ = nullptr;
     }
 }
 
@@ -214,6 +222,9 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
     uint32_t n_ctx          = n_ctx_;
     std::string              grammar_str;
     std::vector<std::string> stop_sequences;
+    std::vector<std::string> grammar_trigger_patterns;
+    std::vector<int32_t>     grammar_trigger_tokens;
+    std::vector<std::string> preserved_tokens;
 
     if (opts.Has("nPredict") && opts.Get("nPredict").IsNumber()) {
         n_predict = opts.Get("nPredict").As<Napi::Number>().Int32Value();
@@ -248,6 +259,33 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
             Napi::Value v = arr.Get(i);
             if (v.IsString()) {
                 stop_sequences.push_back(v.As<Napi::String>().Utf8Value());
+            }
+        }
+    }
+    if (opts.Has("grammarTriggerPatterns") && opts.Get("grammarTriggerPatterns").IsArray()) {
+        Napi::Array arr = opts.Get("grammarTriggerPatterns").As<Napi::Array>();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Value v = arr.Get(i);
+            if (v.IsString()) {
+                grammar_trigger_patterns.push_back(v.As<Napi::String>().Utf8Value());
+            }
+        }
+    }
+    if (opts.Has("grammarTriggerTokens") && opts.Get("grammarTriggerTokens").IsArray()) {
+        Napi::Array arr = opts.Get("grammarTriggerTokens").As<Napi::Array>();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Value v = arr.Get(i);
+            if (v.IsNumber()) {
+                grammar_trigger_tokens.push_back(v.As<Napi::Number>().Int32Value());
+            }
+        }
+    }
+    if (opts.Has("preservedTokens") && opts.Get("preservedTokens").IsArray()) {
+        Napi::Array arr = opts.Get("preservedTokens").As<Napi::Array>();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Value v = arr.Get(i);
+            if (v.IsString()) {
+                preserved_tokens.push_back(v.As<Napi::String>().Utf8Value());
             }
         }
     }
@@ -295,7 +333,10 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
         n_ctx, reset_context,
         n_predict, temperature, top_p, top_k,
         min_p, repeat_penalty, repeat_last_n,
-        std::move(grammar_str), std::move(stop_sequences)
+        std::move(grammar_str), std::move(stop_sequences),
+        std::move(grammar_trigger_patterns),
+        std::move(grammar_trigger_tokens),
+        std::move(preserved_tokens)
     );
 
     worker->Queue();
@@ -351,6 +392,10 @@ void LlamaModel::Dispose(const Napi::CallbackInfo & /*info*/) {
     if (model_) {
         llama_model_free(model_);
         model_ = nullptr;
+    }
+    if (chat_templates_) {
+        common_chat_templates_free(chat_templates_);
+        chat_templates_ = nullptr;
     }
 }
 

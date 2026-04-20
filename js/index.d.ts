@@ -57,6 +57,169 @@ export interface GenerateOptions {
      * `model.abort()`, other concurrent generations are unaffected.
      */
     signal?: AbortSignal;
+    /**
+     * Lazy-grammar trigger patterns. When set (and `grammar` is also set),
+     * the grammar stays inactive until one of these regex patterns appears
+     * in the output, then activates for the remainder. Typically obtained
+     * from `applyChatTemplateJinja` when tools are present.
+     */
+    grammarTriggerPatterns?: string[];
+    /**
+     * Lazy-grammar trigger token IDs. Like `grammarTriggerPatterns`, but
+     * matches on specific vocab tokens instead of string patterns.
+     */
+    grammarTriggerTokens?: number[];
+    /**
+     * Special tokens that must be preserved as atomic units during sampling
+     * (e.g. `<tool_call>`, `<|channel|>`). Reserved for future wiring into
+     * the sampler's preserved-tokens list; currently passed through for
+     * forward-compatibility.
+     */
+    preservedTokens?: string[];
+}
+
+export interface ChatTemplateTool {
+    type?: 'function';
+    function?: { name: string; description?: string; parameters?: unknown };
+    /** Flat form also accepted: { name, description, parameters }. */
+    name?: string;
+    description?: string;
+    parameters?: unknown;
+}
+
+export interface ApplyChatTemplateJinjaOptions {
+    /** OpenAI-format tool definitions. */
+    tools?: ChatTemplateTool[];
+    /** 'auto' (default), 'required', or 'none'. */
+    toolChoice?: 'auto' | 'required' | 'none';
+    /** Allow the model to emit multiple tool calls in one turn. Default: false. */
+    parallelToolCalls?: boolean;
+    /** Append the assistant-turn prefix. Default: true. */
+    addGenerationPrompt?: boolean;
+    /** Enable `<think>`-style reasoning blocks when the template supports it. Default: true. */
+    enableThinking?: boolean;
+    /**
+     * Raw GBNF grammar, used when `tools` and `jsonSchema` are both absent.
+     * When tools or jsonSchema are present, this field is ignored by
+     * libcommon (it replaces it with the auto-generated tool/schema grammar).
+     */
+    grammar?: string;
+    /** JSON schema (object or JSON string) to constrain free-form output. */
+    jsonSchema?: string | object;
+    /**
+     * Arbitrary Jinja template variables. Values are JSON strings as
+     * consumed by the template (e.g. `{ enable_thinking: 'true' }`).
+     */
+    chatTemplateKwargs?: Record<string, string>;
+    /**
+     * Full Jinja template source used in place of the model's embedded
+     * template. Useful when the GGUF stores only a legacy alias name
+     * (e.g. `mistral-v7-tekken`) — paste the template from the model's
+     * HuggingFace `tokenizer_config.json` here.
+     */
+    chatTemplateOverride?: string;
+}
+
+export interface ParsedToolCall {
+    name: string;
+    /** Arguments as a JSON string (parse via `JSON.parse`). */
+    arguments: string;
+    /** Call id, empty string if the format didn't provide one. */
+    id: string;
+}
+
+export interface ParsedChatMessage {
+    content: string;
+    reasoningContent: string;
+    toolCalls: ParsedToolCall[];
+    /** Present only on tool-result messages. */
+    toolName?: string;
+    toolCallId?: string;
+}
+
+export interface ParseChatResponseOptions {
+    /**
+     * Format tag from `ChatTemplateJinjaResult.format`. One of:
+     * 'Content-only', 'peg-simple', 'peg-native', 'peg-gemma4', or 'legacy'.
+     */
+    format: string;
+    /** Opaque PEG parser blob from `ChatTemplateJinjaResult.parser`. */
+    parser?: string;
+    /** Pass through `ChatTemplateJinjaResult.generationPrompt` when available. */
+    generationPrompt?: string;
+    /** Enable tool-call extraction. Default: true. */
+    parseToolCalls?: boolean;
+    /**
+     * Set true when `text` is a streaming partial; the parser will attempt
+     * best-effort recovery rather than failing on incomplete output.
+     */
+    isPartial?: boolean;
+}
+
+export interface ChatOptions extends Omit<GenerateOptions, 'grammar' | 'grammarTriggerPatterns' | 'grammarTriggerTokens' | 'preservedTokens'> {
+    messages: Array<ChatMessage | object>;
+    tools?: ChatTemplateTool[];
+    toolChoice?: 'auto' | 'required' | 'none';
+    parallelToolCalls?: boolean;
+    enableThinking?: boolean;
+    jsonSchema?: string | object;
+    chatTemplateKwargs?: Record<string, string>;
+    chatTemplateOverride?: string;
+}
+
+export interface ChatResult {
+    content: string;
+    reasoningContent: string;
+    toolCalls: ParsedToolCall[];
+    format: string;
+    /** Full generated text, before parsing. Useful for debugging. */
+    raw: string;
+}
+
+export interface ChatTemplateJinjaResult {
+    /** Rendered prompt, ready to pass to `generate()`. */
+    prompt: string;
+    /**
+     * Parser-format tag. One of 'Content-only', 'peg-simple', 'peg-native',
+     * 'peg-gemma4', or 'legacy' (the last is emitted when the embedded
+     * template was an alias string and the legacy renderer was used).
+     * Pass this to `parseChatResponse()` alongside `parser`.
+     */
+    format: string;
+    /**
+     * Opaque serialised PEG parser arena (from `common_peg_arena::save()`).
+     * Hand it back to `parseChatResponse()` unchanged. May be absent for
+     * formats that don't need a parser (content-only, legacy).
+     */
+    parser?: string;
+    /**
+     * Generation-prompt prefix used by some formats during parsing. Pass
+     * along with `parser` to `parseChatResponse()` when present.
+     */
+    generationPrompt?: string;
+    /**
+     * Auto-generated GBNF grammar that constrains tool-call / json-schema
+     * output. Present when tools or jsonSchema were provided, or when the
+     * caller-supplied `grammar` was passed through unchanged.
+     */
+    grammar?: string;
+    /**
+     * When true, `grammar` is applied lazily — only after one of the
+     * triggers fires. Feed this along with the trigger arrays into
+     * `generate()`'s matching options.
+     */
+    grammarLazy?: boolean;
+    /** Regex patterns that activate the lazy grammar. */
+    grammarTriggerPatterns?: string[];
+    /** Vocab token IDs that activate the lazy grammar. */
+    grammarTriggerTokens?: number[];
+    /** Tokens that must be preserved as atomic units during sampling. */
+    preservedTokens?: string[];
+    /**
+     * Additional stop sequences required by the template (e.g. turn-end
+     * markers). Merge with your own `stop` before calling `generate()`.
+     */
+    additionalStops?: string[];
 }
 
 export interface ChatMessage {
@@ -162,6 +325,29 @@ export declare class LlamaModel {
      * Uses llama.cpp's built-in template renderer (not a full Jinja parser).
      */
     applyChatTemplate(messages: ChatMessage[], opts?: ApplyChatTemplateOptions): string;
+    /**
+     * Jinja-based renderer (libcommon). Supports tools, json_schema, and
+     * reasoning toggles; returns the auto-generated grammar + triggers +
+     * stops alongside the rendered prompt so the caller can feed them back
+     * into `generate()` (or merge them with their own grammar).
+     */
+    applyChatTemplateJinja(
+        messages: ChatMessage[] | object[],
+        opts?: ApplyChatTemplateJinjaOptions
+    ): ChatTemplateJinjaResult;
+    /**
+     * Parse a model response into `{ content, reasoningContent, toolCalls }`.
+     * Use the `format` (and `parser`) fields from `applyChatTemplateJinja`
+     * so libcommon knows which per-model-family parser to run.
+     */
+    parseChatResponse(text: string, opts: ParseChatResponseOptions): ParsedChatMessage;
+    /**
+     * One-shot chat helper: render → generate → parse. Handles all the
+     * template-returned grammar/triggers/stops internally. Equivalent to
+     * calling `applyChatTemplateJinja` + `generate` + `parseChatResponse`
+     * manually, but bundled for the common case.
+     */
+    chat(opts: ChatOptions): Promise<ChatResult>;
     /** Convert text to token IDs. */
     tokenize(text: string, opts?: TokenizeOptions): number[];
     /** Convert token IDs back to text. */
@@ -197,8 +383,8 @@ export declare class LlamaModelPool {
     generate(name: string, prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, undefined>;
 
     /**
-     * Dispose a single model and free its native resources.
-     * The registration is kept — the model reloads on next `load()` or `generate()`.
+     * Dispose a model and remove it from the pool. The `name` is released —
+     * re-register it explicitly to load again.
      */
     unload(name: string): void;
 

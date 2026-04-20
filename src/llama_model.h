@@ -10,6 +10,11 @@
 
 #include "llama.h"
 
+// Forward-declared here to keep common/chat.h (and its heavy Jinja / JSON
+// transitive includes) out of this header. Defined in common/chat.h; freed
+// via common_chat_templates_free() from the .cpp.
+struct common_chat_templates;
+
 // Per-request cancellation state. Shared between LlamaModel's request map
 // and the GenerateWorker running the request, so either side can signal
 // cancellation without touching the other's lifetime.
@@ -54,6 +59,17 @@ private:
     Napi::Value ContextLength(const Napi::CallbackInfo & info);
     Napi::Value ChatTemplate(const Napi::CallbackInfo & info);
     Napi::Value ApplyChatTemplate(const Napi::CallbackInfo & info);
+    // Both implemented in chat_templates.cpp.
+    //
+    // ApplyChatTemplateJinja uses libcommon's Jinja renderer so it can take
+    // tools / json_schema / enable_thinking and return the auto-generated
+    // grammar + triggers + parser format name. Auto-falls back to the legacy
+    // named-template path when the embedded template is an alias string.
+    //
+    // ParseChatResponse round-trips the opaque `parser` blob (from
+    // common_peg_arena::save()) and extracts { content, reasoning, toolCalls }.
+    Napi::Value ApplyChatTemplateJinja(const Napi::CallbackInfo & info);
+    Napi::Value ParseChatResponse(const Napi::CallbackInfo & info);
     Napi::Value Tokenize(const Napi::CallbackInfo & info);
     Napi::Value Detokenize(const Napi::CallbackInfo & info);
     Napi::Value GetModelInfo(const Napi::CallbackInfo & info);
@@ -80,6 +96,10 @@ private:
     // by the worker thread under ctx_mutex_, and by AbortCallback which is
     // invoked from llama_decode on that same thread — no external race.
     std::shared_ptr<RequestState>                                active_request_;
+
+    // Lazily initialised on first ApplyChatTemplateJinja call and reused for
+    // the lifetime of the model. Freed in Dispose() / dtor.
+    common_chat_templates * chat_templates_ = nullptr;
 
     bool disposed_ = false;
 };

@@ -42,7 +42,10 @@ GenerateWorker::GenerateWorker(
     float                             repeat_penalty,
     int32_t                           repeat_last_n,
     std::string                       grammar_str,
-    std::vector<std::string>          stop_sequences
+    std::vector<std::string>          stop_sequences,
+    std::vector<std::string>          grammar_trigger_patterns,
+    std::vector<int32_t>              grammar_trigger_tokens,
+    std::vector<std::string>          preserved_tokens
 )
     : Napi::AsyncProgressQueueWorker<TokenChunk>(token_cb.Env()),
       owner_(owner),
@@ -58,7 +61,10 @@ GenerateWorker::GenerateWorker(
       repeat_penalty_(repeat_penalty),
       repeat_last_n_(repeat_last_n),
       grammar_str_(std::move(grammar_str)),
-      stop_sequences_(std::move(stop_sequences))
+      stop_sequences_(std::move(stop_sequences)),
+      grammar_trigger_patterns_(std::move(grammar_trigger_patterns)),
+      grammar_trigger_tokens_(std::move(grammar_trigger_tokens)),
+      preserved_tokens_(std::move(preserved_tokens))
 {
     token_cb_ = Napi::Persistent(token_cb);
     done_cb_  = Napi::Persistent(done_cb);
@@ -163,10 +169,34 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     llama_sampler * smpl =
         llama_sampler_chain_init(llama_sampler_chain_default_params());
 
-    // 1. Grammar — constrain logits before any probability filtering
+    // 1. Grammar — constrain logits before any probability filtering.
+    //    Triggers switch the sampler to "lazy" mode: grammar stays off until
+    //    one of the patterns/tokens appears in the output, then activates for
+    //    the remainder. Used e.g. for tool calls where the model writes prose
+    //    first and only constrains once it emits <tool_call>.
     if (!grammar_str_.empty()) {
-        llama_sampler_chain_add(smpl,
-            llama_sampler_init_grammar(vocab, grammar_str_.c_str(), "root"));
+        const bool lazy =
+            !grammar_trigger_patterns_.empty() || !grammar_trigger_tokens_.empty();
+        if (lazy) {
+            std::vector<const char *> pat_ptrs;
+            pat_ptrs.reserve(grammar_trigger_patterns_.size());
+            for (const auto & p : grammar_trigger_patterns_) {
+                pat_ptrs.push_back(p.c_str());
+            }
+            std::vector<llama_token> tok_ids;
+            tok_ids.reserve(grammar_trigger_tokens_.size());
+            for (auto t : grammar_trigger_tokens_) {
+                tok_ids.push_back((llama_token)t);
+            }
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_grammar_lazy_patterns(
+                    vocab, grammar_str_.c_str(), "root",
+                    pat_ptrs.data(), pat_ptrs.size(),
+                    tok_ids.data(),  tok_ids.size()));
+        } else {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_grammar(vocab, grammar_str_.c_str(), "root"));
+        }
     }
     // 2. Repeat penalty
     if (repeat_penalty_ != 1.0f && repeat_last_n_ != 0) {

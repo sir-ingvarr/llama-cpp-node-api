@@ -59,14 +59,18 @@ When llama-node is `add_subdirectory`'d inside a parent CMake project that alrea
 
 ```
 js/index.js                   ← JS wrapper: async generator, AbortSignal bridge,
-                                 LlamaModelPool, quantize()
+                                 LlamaModelPool, chat(), parseChatResponse(), quantize()
 js/index.d.ts                 ← TypeScript declarations
 src/addon.cpp                 ← N-API entry: backend init, LlamaModel + quantize registration
 src/llama_model.cpp/.h        ← LlamaModel: load model, request map, dispatch worker
 src/generate_worker.cpp/.h    ← AsyncProgressQueueWorker: llama_decode on libuv thread
 src/quantize_worker.cpp/.h    ← AsyncWorker: llama_model_quantize on libuv thread
+src/chat_templates.cpp        ← libcommon Jinja renderer + chat-response parser
+                                 (applyChatTemplateJinja, parseChatResponse)
 vendor/llama.cpp/             ← git submodule (pinned commit)
 ```
+
+Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD_COMMON` is forced `ON` so libcommon (minja Jinja, nlohmann/json, PEG parser, chat format registry) is available.
 
 ### Key design points
 
@@ -80,9 +84,16 @@ vendor/llama.cpp/             ← git submodule (pinned commit)
 
 - **`QuantizeWorker` (C++)** — thin wrapper over `llama_model_quantize`. Standalone (no `LlamaModel` instance needed); registered as module-level `quantize()` in `addon.cpp`. Ftype name lookup lives in `quantize_worker.cpp`.
 
+- **`chat_templates.cpp`** — Jinja chat rendering + response parsing via libcommon. Exposes two `LlamaModel` methods:
+  - `applyChatTemplateJinja(messages, opts)` → `{ prompt, format, parser?, grammar?, grammarLazy?, grammarTriggerPatterns?, grammarTriggerTokens?, preservedTokens?, additionalStops? }`. Auto-falls back to `llama_chat_apply_template` (legacy C API, resolves alias names like `mistral-v7-tekken`) when the embedded template isn't Jinja source; throws if `tools` / `jsonSchema` were supplied on that path (can't be honoured). `chatTemplateOverride` lets the caller supply full Jinja source when the embedded template is an alias.
+  - `parseChatResponse(text, { format, parser, ... })` → `{ content, reasoningContent, toolCalls[] }`. Round-trips the opaque `parser` blob (from `common_peg_arena::save()`) and dispatches to the right per-format parser. `format === 'legacy'` bypasses parsing and returns `text` as content.
+  - The `common_chat_templates *` is lazily initialised on first use and cached on the `LlamaModel` instance; freed in `~LlamaModel` / `Dispose()`.
+
+- **Lazy grammar** — `GenerateWorker` branches on `grammarTriggerPatterns` / `grammarTriggerTokens`: if either is non-empty, uses `llama_sampler_init_grammar_lazy_patterns()` (grammar activates only after a trigger appears in the output); else uses eager `llama_sampler_init_grammar()`. Backward-compatible: existing callers passing only `grammar` see no behavioural change. Trigger conversion from libcommon's typed `common_grammar_trigger` mirrors `common/sampling.cpp` (regex_escape words, anchor PATTERN_FULL patterns, TOKEN triggers go to the separate token-array argument).
+
 - **Sampler chain order** — grammar → penalties → top_k → top_p → min_p → temperature → dist. Grammar must be first so it zeroes out non-grammatical tokens from the full distribution before probability filters can discard required ones.
 
-- **`js/index.js`** — Bridges the native callback API to an async generator (queue + Promise resolver). Reads `grammarFile` from disk before the native call. Wires `opts.signal` (AbortSignal) to `native.abortRequest(id)` and throws `AbortError` when the signal fires. Exports `LlamaModel`, `LlamaModelPool`, `quantize`, `quantizeFtypes`.
+- **`js/index.js`** — Bridges the native callback API to an async generator (queue + Promise resolver). Reads `grammarFile` from disk before the native call. Wires `opts.signal` (AbortSignal) to `native.abortRequest(id)` and throws `AbortError` when the signal fires. Exports `LlamaModel`, `LlamaModelPool`, `quantize`, `quantizeFtypes`. `LlamaModel.chat(opts)` is a one-shot helper that bundles `applyChatTemplateJinja` → `generate` → `parseChatResponse`, buffering tokens and returning `{ content, reasoningContent, toolCalls[], format, raw }`. No streaming variant yet — for streaming, use `generate()` directly.
 
 - **`LlamaModelPool` (JS)** — Registers models by name, loads lazily on first `generate()` or `load()` call, supports `unload(name)` to free a single model's resources while keeping its registration.
 
@@ -104,13 +115,16 @@ vendor/llama.cpp/             ← git submodule (pinned commit)
 ## Smoke tests
 
 ```bash
-node smoke.js             /path/to/model.gguf    # sampling + pool
-node smoke_concurrent.js  /path/to/model.gguf    # queue + abort semantics
+node smoke.js              /path/to/model.gguf    # sampling + pool
+node smoke_concurrent.js   /path/to/model.gguf    # queue + abort semantics
+node smoke_chat_jinja.js   /path/to/model.gguf    # Jinja templates + tools + chat()
 ```
 
 `smoke.js` covers baseline generation, minP, repeatPenalty, stop sequences, and `LlamaModelPool`.
 
 `smoke_concurrent.js` covers: two overlapping `generate()` calls on the same model; per-request cancellation via `opts.signal` (AbortSignal → `AbortError`); global `model.abort()` stopping everything in flight.
+
+`smoke_chat_jinja.js` covers: `applyChatTemplateJinja` on content-only and tool-annotated prompts; end-to-end `chat()` extracting structured tool calls; `parseChatResponse` on free-form output; lazy grammar with a manual trigger. Requires a tool-trained model (e.g. Llama 3.1+) to exercise the full tools path; works on any Jinja-templated model for the content-only path.
 
 ### Native addon loader
 

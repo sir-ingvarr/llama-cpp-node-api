@@ -31,7 +31,10 @@ public:
         float                             repeat_penalty,
         int32_t                           repeat_last_n,
         std::string                       grammar_str,
-        std::vector<std::string>          stop_sequences
+        std::vector<std::string>          stop_sequences,
+        std::vector<std::string>          grammar_trigger_patterns,
+        std::vector<int32_t>              grammar_trigger_tokens,
+        std::vector<std::string>          preserved_tokens
     );
 
     void Execute(const ExecutionProgress & progress) override;
@@ -56,4 +59,9 @@ private:
     int32_t                       repeat_last_n_;
     std::string                   grammar_str_;
     std::vector<std::string>      stop_sequences_;
+    // Lazy-grammar inputs — when grammar_trigger_patterns_ and
+    // grammar_trigger_tokens_ are both empty, grammar is applied eagerly.
+    std::vector<std::string>      grammar_trigger_patterns_;
+    std::vector<int32_t>          grammar_trigger_tokens_;
+    std::vector<std::string>      preserved_tokens_;  // reserved for future use
 };
