@@ -50,9 +50,9 @@
         "node-addon-api": "^8.3.0"
     },
     "optionalDependencies": {
-        "@llama-cpp-node-api/darwin-arm64": "0.10.0",
-        "@llama-cpp-node-api/darwin-x64": "0.10.0",
-        "@llama-cpp-node-api/linux-x64": "0.10.0",
-        "@llama-cpp-node-api/win32-x64": "0.10.0"
+        "@llama-cpp-node-api/darwin-arm64": "0.11.0",
+        "@llama-cpp-node-api/darwin-x64": "0.11.0",
+        "@llama-cpp-node-api/linux-x64": "0.11.0",
+        "@llama-cpp-node-api/win32-x64": "0.11.0"
     }
 }

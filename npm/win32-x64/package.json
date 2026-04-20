@@ -1,11 +1,17 @@
 {
     "name": "@llama-cpp-node-api/win32-x64",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "llama-cpp-node-api native binary for Windows x64",
-    "os": ["win32"],
-    "cpu": ["x64"],
+    "os": [
+        "win32"
+    ],
+    "cpu": [
+        "x64"
+    ],
     "main": "llama_node.node",
-    "files": ["llama_node.node"],
+    "files": [
+        "llama_node.node"
+    ],
     "license": "MIT",
     "repository": {
         "type": "git",
