@@ -1,6 +1,6 @@
 {
     "name": "llama-cpp-node-api",
-    "version": "0.10.0",
+    "version": "0.11.0",
     "description": "Node.js native addon for llama.cpp — direct in-process inference",
     "main": "js/index.js",
     "types": "js/index.d.ts",
