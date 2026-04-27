@@ -18,6 +18,18 @@ struct LoadHandle {
     bool          embeddings   = false;
     // -1 = LLAMA_POOLING_TYPE_UNSPECIFIED (let the model decide).
     int32_t       pooling_type = -1;
+    // -1 = leave llama_context_default_params() default (currently F16).
+    int32_t       cache_type_k = -1;
+    int32_t       cache_type_v = -1;
+    // -1 = LLAMA_FLASH_ATTN_TYPE_AUTO (let llama.cpp decide).
+    int32_t       flash_attn_type = -1;
+    // -1 = leave llama_context_default_params() default.
+    int32_t       n_threads       = -1;
+    int32_t       n_threads_batch = -1;
+    // Model-load flags (applied before llama_model_load_from_file). True/false
+    // override defaults; the worker uses these directly.
+    bool          use_mmap   = true;
+    bool          use_mlock  = false;
 };
 
 // LoadWorker runs llama_model_load_from_file on a libuv worker thread so the

@@ -6,6 +6,7 @@
 
 #include "chat.h"  // libcommon: common_chat_templates_free
 
+#include <cstdlib>
 #include <string>
 #include <utility>
 #include <vector>
@@ -64,6 +65,21 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
     if (opts.Has("poolingType") && opts.Get("poolingType").IsNumber()) {
         pooling_type_ = opts.Get("poolingType").As<Napi::Number>().Int32Value();
     }
+    if (opts.Has("cacheTypeK") && opts.Get("cacheTypeK").IsNumber()) {
+        cache_type_k_ = opts.Get("cacheTypeK").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("cacheTypeV") && opts.Get("cacheTypeV").IsNumber()) {
+        cache_type_v_ = opts.Get("cacheTypeV").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("flashAttention") && opts.Get("flashAttention").IsNumber()) {
+        flash_attn_type_ = opts.Get("flashAttention").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("nThreads") && opts.Get("nThreads").IsNumber()) {
+        n_threads_ = opts.Get("nThreads").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("nThreadsBatch") && opts.Get("nThreadsBatch").IsNumber()) {
+        n_threads_batch_ = opts.Get("nThreadsBatch").As<Napi::Number>().Int32Value();
+    }
 
     // ----- Async path: 3rd arg is an External<LoadHandle> from LoadWorker.
     //       Take ownership of the already-loaded model; skip the sync load.
@@ -80,6 +96,11 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
         n_ctx_         = handle->n_ctx;
         embeddings_    = handle->embeddings;
         pooling_type_  = handle->pooling_type;
+        cache_type_k_     = handle->cache_type_k;
+        cache_type_v_     = handle->cache_type_v;
+        flash_attn_type_  = handle->flash_attn_type;
+        n_threads_        = handle->n_threads;
+        n_threads_batch_  = handle->n_threads_batch;
         vocab_         = llama_model_get_vocab(model_);
         return;
     }
@@ -100,6 +121,12 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     model_params.progress_callback = [](float, void *) { return true; };
+    if (opts.Has("useMmap") && opts.Get("useMmap").IsBoolean()) {
+        model_params.use_mmap = opts.Get("useMmap").As<Napi::Boolean>().Value();
+    }
+    if (opts.Has("useMlock") && opts.Get("useMlock").IsBoolean()) {
+        model_params.use_mlock = opts.Get("useMlock").As<Napi::Boolean>().Value();
+    }
 
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model_) {
@@ -193,6 +220,22 @@ bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
     }
     if (pooling_type_ >= 0) {
         ctx_params.pooling_type = (enum llama_pooling_type) pooling_type_;
+    }
+    if (cache_type_k_ >= 0) {
+        ctx_params.type_k = (enum ggml_type) cache_type_k_;
+    }
+    if (cache_type_v_ >= 0) {
+        ctx_params.type_v = (enum ggml_type) cache_type_v_;
+    }
+    if (flash_attn_type_ >= -1) {
+        // -1 (AUTO) is also a valid enum value, so always assign.
+        ctx_params.flash_attn_type = (enum llama_flash_attn_type) flash_attn_type_;
+    }
+    if (n_threads_ > 0) {
+        ctx_params.n_threads = n_threads_;
+    }
+    if (n_threads_batch_ > 0) {
+        ctx_params.n_threads_batch = n_threads_batch_;
     }
 
     ctx_ = llama_init_from_model(model_, ctx_params);
@@ -347,6 +390,29 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
         top_logprobs_n = opts.Get("topLogprobs").As<Napi::Number>().Int32Value();
         if (top_logprobs_n > 0) want_logprobs = true;  // imply logprobs
     }
+    int64_t seed_opt = -1;
+    if (opts.Has("seed") && opts.Get("seed").IsNumber()) {
+        seed_opt = opts.Get("seed").As<Napi::Number>().Int64Value();
+    }
+    std::vector<std::pair<int32_t, float>> logit_bias;
+    if (opts.Has("logitBias") && opts.Get("logitBias").IsObject()) {
+        Napi::Object lb = opts.Get("logitBias").As<Napi::Object>();
+        Napi::Array  keys = lb.GetPropertyNames();
+        logit_bias.reserve(keys.Length());
+        for (uint32_t i = 0; i < keys.Length(); ++i) {
+            Napi::Value k = keys.Get(i);
+            // Numeric-string keys (JS object keys are always strings) →
+            // parse to int. Skip non-numeric keys and non-finite values.
+            std::string ks = k.ToString().Utf8Value();
+            char * end = nullptr;
+            long tok_id = std::strtol(ks.c_str(), &end, 10);
+            if (end == ks.c_str() || *end != '\0') continue;
+            Napi::Value v = lb.Get(k);
+            if (!v.IsNumber()) continue;
+            float bias = v.As<Napi::Number>().FloatValue();
+            logit_bias.emplace_back((int32_t) tok_id, bias);
+        }
+    }
 
     // Context setup (possibly involving llama_free / llama_init_from_model)
     // is done by the worker under ctx_mutex_ — never on the JS main thread,
@@ -391,7 +457,8 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
         std::move(grammar_trigger_patterns),
         std::move(grammar_trigger_tokens),
         std::move(preserved_tokens),
-        want_logprobs, top_logprobs_n
+        want_logprobs, top_logprobs_n,
+        seed_opt, std::move(logit_bias)
     );
 
     worker->Queue();

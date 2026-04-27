@@ -22,6 +22,8 @@ void LoadWorker::Execute() {
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers       = handle_->n_gpu_layers;
     model_params.progress_callback  = [](float, void *) { return true; };
+    model_params.use_mmap           = handle_->use_mmap;
+    model_params.use_mlock          = handle_->use_mlock;
 
     handle_->model = llama_model_load_from_file(path_.c_str(), model_params);
     if (!handle_->model) {
@@ -85,6 +87,27 @@ static Napi::Value LoadModel(const Napi::CallbackInfo & info) {
     }
     if (opts.Has("poolingType") && opts.Get("poolingType").IsNumber()) {
         handle->pooling_type = opts.Get("poolingType").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("cacheTypeK") && opts.Get("cacheTypeK").IsNumber()) {
+        handle->cache_type_k = opts.Get("cacheTypeK").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("cacheTypeV") && opts.Get("cacheTypeV").IsNumber()) {
+        handle->cache_type_v = opts.Get("cacheTypeV").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("flashAttention") && opts.Get("flashAttention").IsNumber()) {
+        handle->flash_attn_type = opts.Get("flashAttention").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("nThreads") && opts.Get("nThreads").IsNumber()) {
+        handle->n_threads = opts.Get("nThreads").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("nThreadsBatch") && opts.Get("nThreadsBatch").IsNumber()) {
+        handle->n_threads_batch = opts.Get("nThreadsBatch").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("useMmap") && opts.Get("useMmap").IsBoolean()) {
+        handle->use_mmap = opts.Get("useMmap").As<Napi::Boolean>().Value();
+    }
+    if (opts.Has("useMlock") && opts.Get("useMlock").IsBoolean()) {
+        handle->use_mlock = opts.Get("useMlock").As<Napi::Boolean>().Value();
     }
 
     auto * worker = new LoadWorker(done, std::move(path), handle);

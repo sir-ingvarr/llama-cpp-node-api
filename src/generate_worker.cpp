@@ -52,7 +52,9 @@ GenerateWorker::GenerateWorker(
     std::vector<int32_t>              grammar_trigger_tokens,
     std::vector<std::string>          preserved_tokens,
     bool                              want_logprobs,
-    int32_t                           top_logprobs_n
+    int32_t                           top_logprobs_n,
+    int64_t                                          seed,
+    std::vector<std::pair<int32_t, float>>           logit_bias
 )
     : Napi::AsyncProgressQueueWorker<TokenChunk>(token_cb.Env()),
       owner_(owner),
@@ -73,7 +75,9 @@ GenerateWorker::GenerateWorker(
       grammar_trigger_tokens_(std::move(grammar_trigger_tokens)),
       preserved_tokens_(std::move(preserved_tokens)),
       want_logprobs_(want_logprobs),
-      top_logprobs_n_(top_logprobs_n)
+      top_logprobs_n_(top_logprobs_n),
+      seed_(seed),
+      logit_bias_(std::move(logit_bias))
 {
     token_cb_ = Napi::Persistent(token_cb);
     done_cb_  = Napi::Persistent(done_cb);
@@ -183,6 +187,22 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     };
     llama_sampler * smpl = smpl_owner.get();
 
+    // 0. Logit bias — additive on raw logits, applied before grammar so that
+    //    a positive bias on a grammar-disallowed token cannot resurrect it
+    //    (grammar masks to -inf afterward and has the final say).
+    if (!logit_bias_.empty()) {
+        std::vector<llama_logit_bias> biases;
+        biases.reserve(logit_bias_.size());
+        for (const auto & [tok, b] : logit_bias_) {
+            biases.push_back({ (llama_token) tok, b });
+        }
+        llama_sampler_chain_add(smpl,
+            llama_sampler_init_logit_bias(
+                llama_vocab_n_tokens(vocab),
+                (int32_t) biases.size(),
+                biases.data()));
+    }
+
     // 1. Grammar — constrain logits before any probability filtering.
     //    Triggers switch the sampler to "lazy" mode: grammar stays off until
     //    one of the patterns/tokens appears in the output, then activates for
@@ -232,8 +252,12 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     }
     // 6. Temperature
     llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature_));
-    // 7. Final stochastic sampler
-    llama_sampler_chain_add(smpl, llama_sampler_init_dist(LLAMA_DEFAULT_SEED));
+    // 7. Final stochastic sampler — `seed_ < 0` means "use the default
+    //    non-deterministic seed"; any non-negative value pins the RNG.
+    {
+        const uint32_t s = (seed_ < 0) ? LLAMA_DEFAULT_SEED : (uint32_t) seed_;
+        llama_sampler_chain_add(smpl, llama_sampler_init_dist(s));
+    }
 
     llama_batch batch =
         llama_batch_get_one(prompt_tokens.data(), (int32_t)prompt_tokens.size());

@@ -95,6 +95,14 @@ private:
     uint32_t             n_ctx_     = 0;
     bool                 embeddings_   = false;  // ctx mode set at construction
     int32_t              pooling_type_ = -1;     // -1 = LLAMA_POOLING_TYPE_UNSPECIFIED
+    // -1 = leave llama_context_default_params() default (currently F16).
+    int32_t              cache_type_k_ = -1;
+    int32_t              cache_type_v_ = -1;
+    // -1 = LLAMA_FLASH_ATTN_TYPE_AUTO (let llama.cpp decide).
+    int32_t              flash_attn_type_ = -1;
+    // -1 = leave llama_context_default_params() default (llama.cpp picks).
+    int32_t              n_threads_       = -1;
+    int32_t              n_threads_batch_ = -1;
     AddonState *         state_     = nullptr;  // borrowed, owned by env
 
     std::mutex           ctx_mutex_;

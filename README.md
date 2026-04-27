@@ -67,6 +67,29 @@ Loads the model **synchronously** on the calling thread — fine for CLI tools a
 | `nCtx` | `2048` | Context window size in tokens. |
 | `embeddings` | `false` | Open in embedding mode — enables `model.embed()`. |
 | `poolingType` | model default | `'mean'`, `'cls'`, `'last'`, `'rank'`, `'none'`, or `'unspecified'`. |
+| `cacheTypeK` | `'f16'` | Quantization for the K (keys) tensor of the KV cache. See below. |
+| `cacheTypeV` | `'f16'` | Quantization for the V (values) tensor of the KV cache. See below. |
+| `flashAttention` | `'auto'` | `'auto'` (let llama.cpp decide), `'on'` (force-enable, required for quantized V cache on most backends), `'off'` (disable). |
+| `nThreads` | llama.cpp default | Threads used during single-token decode. Tune for CPU-only setups; ignored when fully offloaded to GPU. |
+| `nThreadsBatch` | llama.cpp default | Threads used during batched / prompt-processing decode. Often higher than `nThreads` on big-core CPUs. |
+| `useMmap` | `true` | Memory-map the model file. Set `false` to avoid cold-cache page-fault stutter at the cost of a longer load and full RAM use. |
+| `useMlock` | `false` | Pin model pages in physical memory so they cannot swap. May require elevated permissions (`ulimit -l` / `CAP_IPC_LOCK`). |
+
+#### KV cache quantization
+
+`cacheTypeK` / `cacheTypeV` cut KV-cache memory in exchange for a small quality cost — useful for fitting a bigger `nCtx` or running more concurrent sessions on the same GPU. Roughly: `q8_0` halves KV memory vs the `f16` default, `q4_0` quarters it.
+
+Accepted values: `'f32' | 'f16' | 'bf16' | 'q8_0' | 'q4_0' | 'q4_1' | 'iq4_nl' | 'q5_0' | 'q5_1'` (the same allowlist `llama-cli` accepts via `--cache-type-k` / `--cache-type-v`).
+
+```js
+const model = await LlamaModel.load('/models/llama-3.1-8b.gguf', {
+    nCtx: 32_768,
+    cacheTypeK: 'q8_0',
+    cacheTypeV: 'q8_0',  // see note below
+});
+```
+
+> Quantized **V** cache (anything other than `f16`/`f32`/`bf16`) typically requires Flash Attention, which the underlying backend may or may not enable automatically. If context creation fails with a Flash-Attention-related error, fall back to `cacheTypeV: 'f16'` and quantize K only.
 
 ### `LlamaModel.load(modelPath, opts?)` → `Promise<LlamaModel>`
 
@@ -105,6 +128,8 @@ Concurrent calls on the same model are allowed — they queue internally and exe
 | `signal` | — | `AbortSignal` that cancels **this** call. The generator throws — `signal.reason` if set (Web standard), otherwise an `AbortError`. Other concurrent calls are unaffected. |
 | `logprobs` | `false` | When `true`, the generator yields `{ text, logprob, topLogprobs }` objects instead of strings. |
 | `topLogprobs` | `0` | Include top-K alternative tokens with logprobs per step. Setting `> 0` implies `logprobs: true`. |
+| `seed` | non-deterministic | Seed for the stochastic sampler. Pin to make generation reproducible for a given prompt + sampler config. |
+| `logitBias` | `{}` | Per-token logit bias `{ tokenId: bias }`, applied additively before grammar. Use `model.tokenize()` to find token IDs. |
 
 #### Cancelling generations
 

@@ -18,7 +18,59 @@ export interface LlamaModelOptions {
      * last-token raw embedding without pooling.
      */
     poolingType?: 'unspecified' | 'none' | 'mean' | 'cls' | 'last' | 'rank';
+    /**
+     * Quantization type for the K (keys) tensor of the KV cache. Default
+     * `'f16'`. Lower-precision types cut KV memory roughly in half (`'q8_0'`)
+     * or more (`'q4_0'`), at a small quality cost — letting you fit a bigger
+     * `nCtx` or run more concurrent contexts. Allowed: `'f32' | 'f16' | 'bf16'
+     * | 'q8_0' | 'q4_0' | 'q4_1' | 'iq4_nl' | 'q5_0' | 'q5_1'`.
+     */
+    cacheTypeK?: CacheType;
+    /**
+     * Quantization type for the V (values) tensor of the KV cache. Same
+     * options and trade-offs as `cacheTypeK`. Note: quantized V cache
+     * generally requires Flash Attention to be enabled in the build.
+     */
+    cacheTypeV?: CacheType;
+    /**
+     * Flash Attention toggle. `'auto'` (default) lets llama.cpp decide based
+     * on the backend; `'on'` forces it (required for quantized V cache on most
+     * backends); `'off'` disables it. Falling back to `'off'` is sometimes
+     * needed when a backend doesn't support FA for the model's head shape.
+     */
+    flashAttention?: 'auto' | 'on' | 'off';
+    /**
+     * Number of threads used for token generation (single-token decode).
+     * Defaults to whatever llama.cpp picks (typically `min(n_logical, 8)` on
+     * CPU, ignored when fully offloaded to GPU). Tune for CPU-only setups.
+     */
+    nThreads?: number;
+    /**
+     * Number of threads used for batch processing (prompt ingest, batched
+     * decode). Same default rules as `nThreads`. Often higher than `nThreads`
+     * on big-core machines because prompt processing parallelises well.
+     */
+    nThreadsBatch?: number;
+    /**
+     * Memory-map the model file instead of reading it into RAM. Default `true`.
+     * Set `false` to avoid mmap stutter (cold-cache page faults during the
+     * first decode) at the cost of a longer load and full RAM usage.
+     */
+    useMmap?: boolean;
+    /**
+     * Lock the model's pages in physical memory so they cannot be swapped
+     * out. Default `false`. Useful for low-latency serving setups; may
+     * require elevated permissions (`ulimit -l` / `CAP_IPC_LOCK`).
+     */
+    useMlock?: boolean;
 }
+
+export type CacheType =
+    | 'f32' | 'f16' | 'bf16'
+    | 'q8_0'
+    | 'q4_0' | 'q4_1'
+    | 'iq4_nl'
+    | 'q5_0' | 'q5_1';
 
 export interface GenerateOptions {
     /** Maximum number of tokens to generate. Default: 256. 0 or negative = unlimited. */
@@ -101,6 +153,22 @@ export interface GenerateOptions {
      * logprobs). Setting `> 0` implies `logprobs: true`.
      */
     topLogprobs?: number;
+    /**
+     * Seed for the stochastic sampler (`dist`). When set, generation is
+     * deterministic for a given prompt + sampler config. Defaults to a
+     * non-deterministic seed (`LLAMA_DEFAULT_SEED`).
+     */
+    seed?: number;
+    /**
+     * Per-token logit bias, applied additively before grammar / penalty /
+     * top-k. Keys are vocab token IDs (use `model.tokenize()` to find them);
+     * values are added to the raw logits. Common idioms:
+     *   - `{ 220: -100 }` to ban a specific token (e.g. a leading space).
+     *   - `{ 13: 5 }` to nudge generation toward a token without forcing it.
+     * Bias is applied before grammar, so grammar still has the final say on
+     * which tokens are legal.
+     */
+    logitBias?: Record<number, number>;
 }
 
 export interface TokenLogprob {

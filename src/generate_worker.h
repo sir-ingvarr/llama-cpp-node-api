@@ -1,8 +1,10 @@
 #pragma once
 
 #include <napi.h>
+#include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "llama_model.h"
@@ -43,7 +45,10 @@ public:
         std::vector<int32_t>              grammar_trigger_tokens,
         std::vector<std::string>          preserved_tokens,
         bool                              want_logprobs,
-        int32_t                           top_logprobs_n
+        int32_t                           top_logprobs_n,
+        // -1 = use LLAMA_DEFAULT_SEED (non-deterministic).
+        int64_t                                          seed,
+        std::vector<std::pair<int32_t, float>>           logit_bias
     );
 
     void Execute(const ExecutionProgress & progress) override;
@@ -75,4 +80,6 @@ private:
     std::vector<std::string>      preserved_tokens_;  // reserved for future use
     bool                          want_logprobs_  = false;
     int32_t                       top_logprobs_n_ = 0;
+    int64_t                                            seed_ = -1;
+    std::vector<std::pair<int32_t, float>>             logit_bias_;
 };

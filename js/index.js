@@ -116,15 +116,66 @@ const POOLING_TYPES = {
     rank:         4,
 };
 
-function normalizeModelOpts(opts) {
-    if (!opts || typeof opts.poolingType !== 'string') return opts;
-    const code = POOLING_TYPES[opts.poolingType.toLowerCase()];
+// Mirror llama.h's enum llama_flash_attn_type.
+const FLASH_ATTN_TYPES = {
+    auto: -1,
+    off:  0,
+    on:   1,
+};
+
+// Mirror ggml.h's enum ggml_type values for the KV-cache-eligible subset
+// (matches llama.cpp's `kv_cache_types` allowlist in common/arg.cpp).
+const CACHE_TYPES = {
+    f32:     0,
+    f16:     1,
+    q4_0:    2,
+    q4_1:    3,
+    q5_0:    6,
+    q5_1:    7,
+    q8_0:    8,
+    iq4_nl: 20,
+    bf16:   30,
+};
+
+function resolveCacheType(name, field) {
+    if (typeof name !== 'string') return name;
+    const code = CACHE_TYPES[name.toLowerCase()];
     if (code === undefined) {
         throw new TypeError(
-            `LlamaModel: unknown poolingType '${opts.poolingType}'. ` +
-            `Valid: ${Object.keys(POOLING_TYPES).join(', ')}`);
+            `LlamaModel: unknown ${field} '${name}'. ` +
+            `Valid: ${Object.keys(CACHE_TYPES).join(', ')}`);
     }
-    return { ...opts, poolingType: code };
+    return code;
+}
+
+function normalizeModelOpts(opts) {
+    if (!opts) return opts;
+    let out = opts;
+    if (typeof opts.poolingType === 'string') {
+        const code = POOLING_TYPES[opts.poolingType.toLowerCase()];
+        if (code === undefined) {
+            throw new TypeError(
+                `LlamaModel: unknown poolingType '${opts.poolingType}'. ` +
+                `Valid: ${Object.keys(POOLING_TYPES).join(', ')}`);
+        }
+        out = { ...out, poolingType: code };
+    }
+    if (typeof opts.cacheTypeK === 'string') {
+        out = { ...out, cacheTypeK: resolveCacheType(opts.cacheTypeK, 'cacheTypeK') };
+    }
+    if (typeof opts.cacheTypeV === 'string') {
+        out = { ...out, cacheTypeV: resolveCacheType(opts.cacheTypeV, 'cacheTypeV') };
+    }
+    if (typeof opts.flashAttention === 'string') {
+        const code = FLASH_ATTN_TYPES[opts.flashAttention.toLowerCase()];
+        if (code === undefined) {
+            throw new TypeError(
+                `LlamaModel: unknown flashAttention '${opts.flashAttention}'. ` +
+                `Valid: ${Object.keys(FLASH_ATTN_TYPES).join(', ')}`);
+        }
+        out = { ...out, flashAttention: code };
+    }
+    return out;
 }
 
 // ---------------------------------------------------------------------------
