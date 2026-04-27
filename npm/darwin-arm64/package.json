@@ -1,6 +1,6 @@
 {
     "name": "@llama-cpp-node-api/darwin-arm64",
-    "version": "0.12.0",
+    "version": "0.12.1",
     "description": "llama-cpp-node-api native binary for macOS ARM64",
     "os": [
         "darwin"
