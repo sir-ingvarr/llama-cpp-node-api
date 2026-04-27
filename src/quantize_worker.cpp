@@ -1,4 +1,5 @@
 #include "quantize_worker.h"
+#include "addon_state.h"
 
 #include <string>
 #include <unordered_map>
@@ -15,12 +16,19 @@ QuantizeWorker::QuantizeWorker(
       params_(params)
 {
     done_cb_ = Napi::Persistent(done_cb);
+    state_   = done_cb.Env().GetInstanceData<AddonState>();
 }
 
 void QuantizeWorker::Execute() {
-    ret_ = llama_model_quantize(input_path_.c_str(), output_path_.c_str(), &params_);
-    if (ret_ != 0) {
-        SetError("llama_model_quantize failed (code " + std::to_string(ret_) + ")");
+    WorkerGuard guard(state_);
+    if (guard.shutting_down()) {
+        SetError("env is shutting down");
+        return;
+    }
+    const uint32_t ret =
+        llama_model_quantize(input_path_.c_str(), output_path_.c_str(), &params_);
+    if (ret != 0) {
+        SetError("llama_model_quantize failed (code " + std::to_string(ret) + ")");
     }
 }
 

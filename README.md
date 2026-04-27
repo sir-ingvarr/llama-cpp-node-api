@@ -59,10 +59,28 @@ You can also inspect the raw template string via `model.chatTemplate`.
 
 ### `new LlamaModel(modelPath, opts?)`
 
+Loads the model **synchronously** on the calling thread — fine for CLI tools and one-off scripts; for anything user-facing, prefer `LlamaModel.load()`.
+
 | Option | Default | Description |
 |--------|---------|-------------|
 | `nGpuLayers` | `99` | Layers to offload to GPU. `0` = CPU only. |
 | `nCtx` | `2048` | Context window size in tokens. |
+| `embeddings` | `false` | Open in embedding mode — enables `model.embed()`. |
+| `poolingType` | model default | `'mean'`, `'cls'`, `'last'`, `'rank'`, `'none'`, or `'unspecified'`. |
+
+### `LlamaModel.load(modelPath, opts?)` → `Promise<LlamaModel>`
+
+Async constructor — loads weights on a libuv worker thread so the JS event loop is **not** blocked while the model is mmap'd and uploaded to the GPU. Same options as the sync constructor; resolves to a ready-to-use model.
+
+```js
+// Use this in any code that runs on the Node.js main thread.
+const model = await LlamaModel.load('/models/llama-3.1-8b.gguf', {
+    nGpuLayers: 99,
+    nCtx: 4096,
+});
+```
+
+A 16 GB model that takes ~1.7s to load fires ~150 setInterval(10ms) ticks during the load — the event loop stays fully responsive.
 
 ### `model.generate(prompt, opts?)`
 
@@ -84,12 +102,14 @@ Concurrent calls on the same model are allowed — they queue internally and exe
 | `stop` | `[]` | Stop sequences. Generation halts on first match; the sequence is not included in output. |
 | `nCtx` | — | Override context size for this call. |
 | `resetContext` | `false` | Clear KV cache before generating (start fresh). |
-| `signal` | — | `AbortSignal` that cancels **this** call. The generator throws an `AbortError` on the next iteration. Other concurrent calls are unaffected. |
+| `signal` | — | `AbortSignal` that cancels **this** call. The generator throws — `signal.reason` if set (Web standard), otherwise an `AbortError`. Other concurrent calls are unaffected. |
+| `logprobs` | `false` | When `true`, the generator yields `{ text, logprob, topLogprobs }` objects instead of strings. |
+| `topLogprobs` | `0` | Include top-K alternative tokens with logprobs per step. Setting `> 0` implies `logprobs: true`. |
 
 #### Cancelling generations
 
 ```js
-// Cancel a single call:
+// 1. AbortSignal — cancel a single call:
 const ac = new AbortController();
 setTimeout(() => ac.abort(), 5_000);
 try {
@@ -97,12 +117,36 @@ try {
         process.stdout.write(t);
     }
 } catch (e) {
-    if (e.name !== 'AbortError') throw e;
+    if (e.name !== 'AbortError') throw e;  // or check `e === ac.signal.reason`
 }
 
-// Cancel every in-flight and queued call on this model:
+// 2. break / return — exiting the for-await early also stops the worker:
+for await (const t of model.generate(prompt)) {
+    if (gotEnough(t)) break;          // native generation is aborted
+}
+
+// 3. model.abort() — cancel every in-flight and queued call (graceful stop,
+//    no AbortError thrown unless the call also had its own signal):
 model.abort();
 ```
+
+`for await ... break` always aborts the underlying worker — there's no risk of a leaked decoder running to completion in the background.
+
+#### Logprobs
+
+```js
+for await (const { text, logprob, topLogprobs } of model.generate(prompt,
+        { nPredict: 8, temperature: 0, logprobs: true, topLogprobs: 5 })) {
+    console.log(text, '→', logprob.toFixed(3));
+    for (const { token, logprob: lp } of topLogprobs) {
+        console.log('   ', JSON.stringify(token), lp.toFixed(3));
+    }
+}
+```
+
+Logprobs are computed from the **raw model distribution** (pre-grammar / pre-penalty / pre-top-k), so they're stable regardless of which sampler stages you have enabled. Useful for classification (compare logprobs of `' yes'` vs `' no'` from the top-K), evaluation harnesses, and OpenAI-API-compatibility shims.
+
+> Caveat: stop-sequence lookahead can flush a chunk whose text spans multiple sampled tokens. In that case the chunk's `logprob` reflects the most recent sampled token (not the entire emitted text). Avoid stop sequences when you need exact token-level alignment.
 
 ### `model.chatTemplate`
 
@@ -122,11 +166,30 @@ Cancels every currently running and queued generation on this model. Each call s
 
 ### `model.dispose()`
 
-Frees model weights and KV cache. Must be called when done.
+Frees model weights and KV cache. Idempotent — safe to call more than once. Any subsequent call to `generate()`, `tokenize()`, `applyChatTemplate*()`, etc. throws.
 
 ### `model.contextLength`
 
 Number of token slots in the current context window. `0` before the first `generate()` call.
+
+### `model.embed(text)` → `Promise<Float32Array>`
+
+Computes a vector embedding for `text`. Requires the model to have been opened with `{ embeddings: true }`; throws otherwise.
+
+```js
+const m = await LlamaModel.load('/models/nomic-embed-text-v1.5.gguf', {
+    embeddings: true,
+    poolingType: 'mean',  // optional — defaults to whatever the model was trained with
+});
+
+const v = await m.embed('the quick brown fox');
+v.length;  // n_embd, e.g. 768
+v.constructor.name;  // 'Float32Array'
+```
+
+Pooling: leave `poolingType` unset to use the model's training-time pooling (typically `'mean'` for BERT-like, `'last'` for last-token-pooling encoders). Set `'none'` to get the raw last-token embedding without pooling.
+
+A model opened with `embeddings: true` can still call `generate()` — every decode populates the embedding buffer as a side effect on generative models, so the same instance can do both. For embedding-only encoders (no LM head) only `embed()` makes sense.
 
 ### `LlamaModelPool`
 
@@ -172,6 +235,41 @@ await quantize('/models/model-f16.gguf',
 | `dryRun` | `false` | Compute and report final size without writing the output. |
 
 Note: this wraps `llama_model_quantize` (C API). Converting from safetensors / Hugging Face formats to GGUF is not included — that path lives in llama.cpp's `convert_hf_to_gguf.py` and requires a Python environment with `torch`, `safetensors`, etc.
+
+### `inspect(path, opts?)`
+
+Reads a GGUF file's header, KV metadata, and tensor descriptors **without loading any tensor weights**. About 6× faster than constructing a `LlamaModel` and uses a fraction of the memory — useful for cheap model identification, shape inspection, or pre-flight validation.
+
+```js
+const { inspect, clearInspectCache } = require('llama-cpp-node-api');
+
+const r = await inspect('/models/llama-3.1-8b.gguf');
+r.version;                                  // 3
+r.alignment;                                // 32
+r.dataOffset;                               // bigint — byte offset of tensor data
+r.metadata['general.architecture'];         // 'llama'
+r.metadata['llama.context_length'];         // 131072
+r.metadata['tokenizer.ggml.tokens'];        // string[] (full vocab)
+r.tensors[0];                               // { name, type: 'F16', offset: bigint, size: bigint }
+```
+
+Returns `Promise<GgufInspectResult>`. Runs on a libuv worker thread.
+
+**Memoization.** Results are cached by canonical path (LRU) and invalidated when the file's `mtime` or `size` changes. Repeat calls on the same file return the same object instance in <1ms.
+
+| Option | Default | Description |
+|--------|---------|-------------|
+| `cache` | `true` | Set to `false` to bypass the cache for one call. |
+
+`clearInspectCache()` flushes the cache manually. The cache size defaults to 8 entries; override via the `LLAMA_NODE_INSPECT_CACHE_MAX` env var (set to `0` to disable caching entirely).
+
+**Type marshaling.** GGUF metadata values are mapped to JS primitives:
+- 8/16/32-bit ints → `number`
+- 64-bit ints → `bigint` (avoids 2^53 precision loss)
+- floats → `number`, bool → `boolean`, strings → `string`
+- arrays preserve element type
+- tensor `offset` and `size`, plus `dataOffset`, are always `bigint`
+- tensor `type` is the ggml type name string (`"F16"`, `"Q4_K"`, `"Q8_0"`, …)
 
 ## Build variants
 

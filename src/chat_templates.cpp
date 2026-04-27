@@ -53,10 +53,16 @@ static void flatten_triggers(
                 out_patterns.push_back(t.value);
                 break;
             case COMMON_GRAMMAR_TRIGGER_TYPE_PATTERN_FULL: {
-                std::string p = t.value;
-                if (p.empty() || (p.front() != '^' && p.back() != '$')) {
-                    p = std::string("^") + t.value + (!t.value.empty() && t.value.back() == '$' ? "" : "$");
-                }
+                // PATTERN_FULL means the trigger pattern must match the entire
+                // accumulated output, so we ensure both anchors are present.
+                // Previous logic only added them when *both* were missing,
+                // which produced single-anchored regexes (`^foo` or `foo$`)
+                // for inputs that already had one anchor.
+                std::string p;
+                p.reserve(t.value.size() + 2);
+                if (t.value.empty() || t.value.front() != '^') p.push_back('^');
+                p.append(t.value);
+                if (t.value.empty() || t.value.back() != '$')  p.push_back('$');
                 out_patterns.push_back(std::move(p));
                 break;
             }

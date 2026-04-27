@@ -15,6 +15,10 @@
 // via common_chat_templates_free() from the .cpp.
 struct common_chat_templates;
 
+// Per-env shared state (worker counter, shutdown flag). Defined in
+// addon_state.h; held by reference here, owned by env.SetInstanceData.
+struct AddonState;
+
 // Per-request cancellation state. Shared between LlamaModel's request map
 // and the GenerateWorker running the request, so either side can signal
 // cancellation without touching the other's lifetime.
@@ -30,11 +34,15 @@ public:
     explicit LlamaModel(const Napi::CallbackInfo & info);
     ~LlamaModel();
 
-    // Accessors used by GenerateWorker.
+    // Accessors used by GenerateWorker / EmbedWorker.
     std::mutex &                         ctx_mutex()       { return ctx_mutex_; }
     bool                                 disposed() const  { return disposed_; }
+    llama_model *                        model() const     { return model_; }
     llama_context *                      ctx() const       { return ctx_; }
     const llama_vocab *                  vocab() const     { return vocab_; }
+    bool                                 is_embedding_mode() const { return embeddings_; }
+    uint32_t                             n_ctx_default() const { return n_ctx_; }
+    AddonState *                         addon_state() const { return state_; }
     void set_active_request(std::shared_ptr<RequestState> s) {
         active_request_ = std::move(s);
     }
@@ -73,6 +81,7 @@ private:
     Napi::Value Tokenize(const Napi::CallbackInfo & info);
     Napi::Value Detokenize(const Napi::CallbackInfo & info);
     Napi::Value GetModelInfo(const Napi::CallbackInfo & info);
+    Napi::Value Embed(const Napi::CallbackInfo & info);
 
     // Internal helpers
     bool EnsureContext(uint32_t n_ctx, std::string & error_out);
@@ -80,10 +89,13 @@ private:
 
     static bool AbortCallback(void * data);
 
-    llama_model *        model_   = nullptr;
-    llama_context *      ctx_     = nullptr;
-    const llama_vocab *  vocab_   = nullptr;
-    uint32_t             n_ctx_   = 0;
+    llama_model *        model_     = nullptr;
+    llama_context *      ctx_       = nullptr;
+    const llama_vocab *  vocab_     = nullptr;
+    uint32_t             n_ctx_     = 0;
+    bool                 embeddings_   = false;  // ctx mode set at construction
+    int32_t              pooling_type_ = -1;     // -1 = LLAMA_POOLING_TYPE_UNSPECIFIED
+    AddonState *         state_     = nullptr;  // borrowed, owned by env
 
     std::mutex           ctx_mutex_;
 

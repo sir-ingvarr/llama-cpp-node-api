@@ -5,6 +5,8 @@
 
 #include "llama.h"
 
+struct AddonState;
+
 // QuantizeWorker runs llama_model_quantize on a libuv worker thread.
 // Wraps the full input→output file conversion; there is no streaming
 // progress (llama.cpp prints its own progress to stderr).
@@ -26,7 +28,7 @@ private:
     std::string                 input_path_;
     std::string                 output_path_;
     llama_model_quantize_params params_;
-    uint32_t                    ret_ = 0;
+    AddonState *                state_ = nullptr;
 };
 
 // Registers the `quantize(input, output, opts, done)` function on `exports`.

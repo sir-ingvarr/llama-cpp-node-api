@@ -1,6 +1,14 @@
 cmake_minimum_required(VERSION 3.15)
 project(llama_node)
 
+# Dedupe transitive libraries during link. Both `llama` and `llama-common`
+# link `ggml` PUBLIC, which produces an "ignoring duplicate libraries"
+# warning from ld64 without this. CMake 3.27+; harmless on older CMake
+# (the link line just keeps the duplicates and ld64 warns).
+if(POLICY CMP0156)
+    cmake_policy(SET CMP0156 NEW)
+endif()
+
 # All targets need PIC: vendor static libs get linked into the shared .node addon
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -82,6 +90,9 @@ add_library(llama_node SHARED
     src/llama_model.cpp
     src/generate_worker.cpp
     src/quantize_worker.cpp
+    src/inspect_worker.cpp
+    src/load_worker.cpp
+    src/embed_worker.cpp
     src/chat_templates.cpp
 )
 

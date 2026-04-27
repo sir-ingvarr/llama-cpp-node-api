@@ -9,6 +9,13 @@
 
 struct TokenChunk {
     std::string text;
+    // Logprob fields are populated only when GenerateWorker was constructed
+    // with want_logprobs_=true. With stop-sequence lookahead a single chunk
+    // can span multiple sampled tokens; in that case `logprob` is the most
+    // recent token's value (documented caveat).
+    bool                                     has_logprobs = false;
+    float                                    logprob      = 0.0f;
+    std::vector<std::pair<std::string, float>> top_logprobs;
 };
 
 // GenerateWorker runs llama_decode on a libuv worker thread and streams
@@ -34,7 +41,9 @@ public:
         std::vector<std::string>          stop_sequences,
         std::vector<std::string>          grammar_trigger_patterns,
         std::vector<int32_t>              grammar_trigger_tokens,
-        std::vector<std::string>          preserved_tokens
+        std::vector<std::string>          preserved_tokens,
+        bool                              want_logprobs,
+        int32_t                           top_logprobs_n
     );
 
     void Execute(const ExecutionProgress & progress) override;
@@ -64,4 +73,6 @@ private:
     std::vector<std::string>      grammar_trigger_patterns_;
     std::vector<int32_t>          grammar_trigger_tokens_;
     std::vector<std::string>      preserved_tokens_;  // reserved for future use
+    bool                          want_logprobs_  = false;
+    int32_t                       top_logprobs_n_ = 0;
 };

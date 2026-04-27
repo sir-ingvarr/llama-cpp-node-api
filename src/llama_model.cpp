@@ -1,5 +1,8 @@
 #include "llama_model.h"
 #include "generate_worker.h"
+#include "embed_worker.h"
+#include "addon_state.h"
+#include "load_worker.h"  // LoadHandle (External payload)
 
 #include "chat.h"  // libcommon: common_chat_templates_free
 
@@ -25,12 +28,12 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod<&LlamaModel::Tokenize>("tokenize"),
         InstanceMethod<&LlamaModel::Detokenize>("detokenize"),
         InstanceMethod<&LlamaModel::GetModelInfo>("getModelInfo"),
+        InstanceMethod<&LlamaModel::Embed>("embed"),
     });
 
-    Napi::FunctionReference * ctor = new Napi::FunctionReference();
-    *ctor = Napi::Persistent(func);
-    env.SetInstanceData(ctor);
-
+    // Note: no SetInstanceData here — the env's instance-data slot is reserved
+    // for AddonState (set by InitModule). The exported function value rooted
+    // via `exports.Set` keeps the constructor alive for the env's lifetime.
     exports.Set("LlamaModel", func);
     return exports;
 }
@@ -50,19 +53,48 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
         return;
     }
 
+    state_ = env.GetInstanceData<AddonState>();
+
+    Napi::Object opts = (info.Length() >= 2 && info[1].IsObject())
+        ? info[1].As<Napi::Object>()
+        : Napi::Object::New(env);
+    if (opts.Has("embeddings") && opts.Get("embeddings").IsBoolean()) {
+        embeddings_ = opts.Get("embeddings").As<Napi::Boolean>().Value();
+    }
+    if (opts.Has("poolingType") && opts.Get("poolingType").IsNumber()) {
+        pooling_type_ = opts.Get("poolingType").As<Napi::Number>().Int32Value();
+    }
+
+    // ----- Async path: 3rd arg is an External<LoadHandle> from LoadWorker.
+    //       Take ownership of the already-loaded model; skip the sync load.
+    if (info.Length() >= 3 && info[2].IsExternal()) {
+        auto * handle = info[2].As<Napi::External<LoadHandle>>().Data();
+        if (!handle || !handle->model) {
+            Napi::Error::New(env,
+                "LlamaModel: load handle is empty (already consumed?)")
+                .ThrowAsJavaScriptException();
+            return;
+        }
+        model_         = handle->model;
+        handle->model  = nullptr;  // External finalizer must not double-free
+        n_ctx_         = handle->n_ctx;
+        embeddings_    = handle->embeddings;
+        pooling_type_  = handle->pooling_type;
+        vocab_         = llama_model_get_vocab(model_);
+        return;
+    }
+
+    // ----- Sync path: load now, on the JS thread.
     std::string model_path = info[0].As<Napi::String>().Utf8Value();
 
     int32_t n_gpu_layers = 99;
     uint32_t n_ctx_opt   = 2048;
 
-    if (info.Length() >= 2 && info[1].IsObject()) {
-        Napi::Object opts = info[1].As<Napi::Object>();
-        if (opts.Has("nGpuLayers") && opts.Get("nGpuLayers").IsNumber()) {
-            n_gpu_layers = opts.Get("nGpuLayers").As<Napi::Number>().Int32Value();
-        }
-        if (opts.Has("nCtx") && opts.Get("nCtx").IsNumber()) {
-            n_ctx_opt = opts.Get("nCtx").As<Napi::Number>().Uint32Value();
-        }
+    if (opts.Has("nGpuLayers") && opts.Get("nGpuLayers").IsNumber()) {
+        n_gpu_layers = opts.Get("nGpuLayers").As<Napi::Number>().Int32Value();
+    }
+    if (opts.Has("nCtx") && opts.Get("nCtx").IsNumber()) {
+        n_ctx_opt = opts.Get("nCtx").As<Napi::Number>().Uint32Value();
     }
 
     llama_model_params model_params = llama_model_default_params();
@@ -97,6 +129,7 @@ LlamaModel::~LlamaModel() {
             llama_model_free(model_);
             model_ = nullptr;
         }
+        vocab_ = nullptr;
     }
     if (chat_templates_) {
         common_chat_templates_free(chat_templates_);
@@ -113,6 +146,11 @@ LlamaModel::~LlamaModel() {
 
 bool LlamaModel::AbortCallback(void * data) {
     auto * self = static_cast<LlamaModel *>(data);
+    // Short-circuit on env shutdown so llama_decode returns promptly during
+    // teardown rather than running to the next token boundary.
+    if (self->state_ && self->state_->shutting_down.load(std::memory_order_acquire)) {
+        return true;
+    }
     auto & state = self->active_request_;
     return state && state->cancel.load(std::memory_order_relaxed);
 }
@@ -149,6 +187,13 @@ bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
     ctx_params.n_batch  = n_ctx;
     ctx_params.abort_callback      = &LlamaModel::AbortCallback;
     ctx_params.abort_callback_data = this;
+    // Embedding mode is set at construction; honored when creating the ctx.
+    if (embeddings_) {
+        ctx_params.embeddings = true;
+    }
+    if (pooling_type_ >= 0) {
+        ctx_params.pooling_type = (enum llama_pooling_type) pooling_type_;
+    }
 
     ctx_ = llama_init_from_model(model_, ctx_params);
     if (!ctx_) {
@@ -293,6 +338,15 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
     if (opts.Has("resetContext") && opts.Get("resetContext").IsBoolean()) {
         reset_context = opts.Get("resetContext").As<Napi::Boolean>().Value();
     }
+    bool    want_logprobs   = false;
+    int32_t top_logprobs_n  = 0;
+    if (opts.Has("logprobs") && opts.Get("logprobs").IsBoolean()) {
+        want_logprobs = opts.Get("logprobs").As<Napi::Boolean>().Value();
+    }
+    if (opts.Has("topLogprobs") && opts.Get("topLogprobs").IsNumber()) {
+        top_logprobs_n = opts.Get("topLogprobs").As<Napi::Number>().Int32Value();
+        if (top_logprobs_n > 0) want_logprobs = true;  // imply logprobs
+    }
 
     // Context setup (possibly involving llama_free / llama_init_from_model)
     // is done by the worker under ctx_mutex_ — never on the JS main thread,
@@ -336,7 +390,8 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
         std::move(grammar_str), std::move(stop_sequences),
         std::move(grammar_trigger_patterns),
         std::move(grammar_trigger_tokens),
-        std::move(preserved_tokens)
+        std::move(preserved_tokens),
+        want_logprobs, top_logprobs_n
     );
 
     worker->Queue();
@@ -369,6 +424,37 @@ void LlamaModel::AbortRequest(const Napi::CallbackInfo & info) {
 }
 
 // ---------------------------------------------------------------------------
+// embed(text, done) — async embed via EmbedWorker (model must be in
+// embedding mode, i.e. constructed with `embeddings: true`).
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::Embed(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (!embeddings_) {
+        Napi::Error::New(env,
+            "embed() requires the model to be loaded with { embeddings: true }")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    if (info.Length() < 2 || !info[0].IsString() || !info[1].IsFunction()) {
+        Napi::TypeError::New(env, "embed(text: string, done: fn)")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+    std::string text = info[0].As<Napi::String>().Utf8Value();
+    Napi::Function done = info[1].As<Napi::Function>();
+
+    auto * worker = new EmbedWorker(done, this, std::move(text));
+    worker->Queue();
+    return env.Undefined();
+}
+
+// ---------------------------------------------------------------------------
 // dispose() — cancel all, wait for current to finish, free resources.
 // ---------------------------------------------------------------------------
 
@@ -393,6 +479,7 @@ void LlamaModel::Dispose(const Napi::CallbackInfo & /*info*/) {
         llama_model_free(model_);
         model_ = nullptr;
     }
+    vocab_ = nullptr;
     if (chat_templates_) {
         common_chat_templates_free(chat_templates_);
         chat_templates_ = nullptr;
@@ -473,8 +560,16 @@ Napi::Value LlamaModel::ApplyChatTemplate(const Napi::CallbackInfo & info) {
             return env.Undefined();
         }
         Napi::Object msg = item.As<Napi::Object>();
-        roles[i]    = msg.Get("role").As<Napi::String>().Utf8Value();
-        contents[i] = msg.Get("content").As<Napi::String>().Utf8Value();
+        Napi::Value role_v    = msg.Get("role");
+        Napi::Value content_v = msg.Get("content");
+        if (!role_v.IsString() || !content_v.IsString()) {
+            Napi::TypeError::New(env,
+                "Each message must have string 'role' and string 'content'")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        roles[i]    = role_v.As<Napi::String>().Utf8Value();
+        contents[i] = content_v.As<Napi::String>().Utf8Value();
         chat[i].role    = roles[i].c_str();
         chat[i].content = contents[i].c_str();
     }
@@ -612,10 +707,15 @@ Napi::Value LlamaModel::GetModelInfo(const Napi::CallbackInfo & info) {
 
     Napi::Object obj = Napi::Object::New(env);
 
-    // Description
-    char desc_buf[256];
-    llama_model_desc(model_, desc_buf, sizeof(desc_buf));
-    obj.Set("description", Napi::String::New(env, desc_buf));
+    // Description. 512 is comfortably above the typical "<arch> <type> <params>
+    // <ftype>" line llama.cpp produces, but llama_model_desc returns the bytes
+    // it actually wrote so we use that to length-bound the JS string.
+    char desc_buf[512];
+    int desc_n = llama_model_desc(model_, desc_buf, sizeof(desc_buf));
+    if (desc_n < 0) desc_n = 0;
+    if ((size_t) desc_n > sizeof(desc_buf)) desc_n = (int) sizeof(desc_buf);
+    obj.Set("description",
+        Napi::String::New(env, desc_buf, (size_t) desc_n));
 
     // Numeric properties
     obj.Set("nParams",           Napi::Number::New(env, (double)llama_model_n_params(model_)));

@@ -3,6 +3,21 @@ export interface LlamaModelOptions {
     nGpuLayers?: number;
     /** Context size in tokens. Default: 2048. */
     nCtx?: number;
+    /**
+     * Open the model in embedding mode. `model.embed()` becomes available
+     * (and is required for embedding-only models like nomic-embed, bge, etc.).
+     * `model.generate()` still works on the same context — every decode
+     * populates the embedding buffer as a side effect — so a generative
+     * model can do both. For embedding-only encoders, only embed() makes sense.
+     */
+    embeddings?: boolean;
+    /**
+     * Pooling strategy applied to per-token embeddings. Defaults to whatever
+     * the model was trained with — typically `'mean'` for BERT-like models,
+     * `'last'` for last-token-pooling encoders. `'none'` returns the
+     * last-token raw embedding without pooling.
+     */
+    poolingType?: 'unspecified' | 'none' | 'mean' | 'cls' | 'last' | 'rank';
 }
 
 export interface GenerateOptions {
@@ -71,11 +86,35 @@ export interface GenerateOptions {
     grammarTriggerTokens?: number[];
     /**
      * Special tokens that must be preserved as atomic units during sampling
-     * (e.g. `<tool_call>`, `<|channel|>`). Reserved for future wiring into
-     * the sampler's preserved-tokens list; currently passed through for
-     * forward-compatibility.
+     * (e.g. `<tool_call>`, `<|channel|>`). Forwarded by `chat()` from the
+     * libcommon Jinja renderer when tools / json_schema are in use; reserved
+     * for direct callers and not yet wired into the native sampler.
      */
     preservedTokens?: string[];
+    /**
+     * Include the chosen token's logprob with each yielded item. When set,
+     * `generate()` yields `TokenWithLogprobs` objects instead of strings.
+     */
+    logprobs?: boolean;
+    /**
+     * Number of top alternative tokens to include per step (with their
+     * logprobs). Setting `> 0` implies `logprobs: true`.
+     */
+    topLogprobs?: number;
+}
+
+export interface TokenLogprob {
+    token: string;
+    /** Natural-log probability under the raw model distribution. */
+    logprob: number;
+}
+
+export interface TokenWithLogprobs {
+    text: string;
+    /** Logprob of the chosen token under the raw model distribution. */
+    logprob: number;
+    /** Top-K alternatives, present only when `topLogprobs` was set. */
+    topLogprobs: TokenLogprob[];
 }
 
 export interface ChatTemplateTool {
@@ -157,7 +196,12 @@ export interface ParseChatResponseOptions {
 }
 
 export interface ChatOptions extends Omit<GenerateOptions, 'grammar' | 'grammarTriggerPatterns' | 'grammarTriggerTokens' | 'preservedTokens'> {
-    messages: Array<ChatMessage | object>;
+    /**
+     * OAI-style chat messages. `unknown[]` is permitted because tool/result
+     * messages and multipart content carry per-format fields not modelled
+     * by `ChatMessage` — let the renderer validate.
+     */
+    messages: ReadonlyArray<ChatMessage | Record<string, unknown>>;
     tools?: ChatTemplateTool[];
     toolChoice?: 'auto' | 'required' | 'none';
     parallelToolCalls?: boolean;
@@ -315,10 +359,22 @@ export interface QuantizeOptions {
 export declare class LlamaModel {
     constructor(modelPath: string, opts?: LlamaModelOptions);
     /**
+     * Async constructor: loads weights on a libuv worker thread so the JS
+     * event loop is not blocked. Equivalent to `new LlamaModel(path, opts)`
+     * once it resolves. Use this in any code path that runs on the Node.js
+     * main thread (Electron renderer, HTTP request handler, etc.).
+     */
+    static load(modelPath: string, opts?: LlamaModelOptions): Promise<LlamaModel>;
+    /**
      * Yields tokens for a single generation. Concurrent calls are allowed —
      * they queue inside the model; only one generation runs at a time.
      * Use `opts.signal` to cancel an individual call; `abort()` cancels all.
+     *
+     * Yields `string` by default; yields `TokenWithLogprobs` when
+     * `opts.logprobs` (or `opts.topLogprobs > 0`) is set.
      */
+    generate(prompt: string, opts: GenerateOptions & { logprobs: true }): AsyncGenerator<TokenWithLogprobs, void, undefined>;
+    generate(prompt: string, opts: GenerateOptions & { topLogprobs: number }): AsyncGenerator<TokenWithLogprobs, void, undefined>;
     generate(prompt: string, opts?: GenerateOptions): AsyncGenerator<string, void, undefined>;
     /**
      * Format messages using the model's built-in chat template.
@@ -332,7 +388,7 @@ export declare class LlamaModel {
      * into `generate()` (or merge them with their own grammar).
      */
     applyChatTemplateJinja(
-        messages: ChatMessage[] | object[],
+        messages: ReadonlyArray<ChatMessage | Record<string, unknown>>,
         opts?: ApplyChatTemplateJinjaOptions
     ): ChatTemplateJinjaResult;
     /**
@@ -354,6 +410,14 @@ export declare class LlamaModel {
     detokenize(tokens: number[], opts?: DetokenizeOptions): string;
     /** Returns model metadata: description, parameter count, sizes, special tokens. */
     getModelInfo(): ModelInfo;
+    /**
+     * Compute an embedding for `text`. Requires the model to have been
+     * constructed with `{ embeddings: true }`; throws otherwise. The returned
+     * Float32Array has length `n_embd` (typically 384–4096 depending on the
+     * model). Pooling is whatever the model was trained with unless
+     * overridden via `poolingType` at construction.
+     */
+    embed(text: string): Promise<Float32Array>;
     /** Cancel every currently running and queued generation on this model. */
     abort(): void;
     dispose(): void;
@@ -388,10 +452,8 @@ export declare class LlamaModelPool {
      */
     unload(name: string): void;
 
-    /** Dispose all loaded models and clear the registry. */
+    /** Dispose all loaded models and clear the registry. Idempotent. */
     dispose(): void;
-
-    get chatTemplate(): string | null;
 
     [Symbol.dispose](): void;
 }
@@ -408,3 +470,62 @@ export declare function quantize(
 
 /** List of ftype names accepted by `quantize()`. */
 export declare function quantizeFtypes(): QuantizeFtype[];
+
+export interface GgufTensorInfo {
+    name: string;
+    /** ggml type name, e.g. "F32", "F16", "Q4_K", "Q8_0". */
+    type: string;
+    /** Byte offset of the tensor data, relative to `dataOffset`. */
+    offset: bigint;
+    /** Byte size of the tensor data on disk. */
+    size: bigint;
+}
+
+/**
+ * GGUF metadata value. Scalar ints under 32 bits become `number`; 64-bit
+ * ints become `bigint` to avoid precision loss. Arrays preserve element type.
+ */
+export type GgufMetaValue =
+    | number
+    | bigint
+    | boolean
+    | string
+    | number[]
+    | bigint[]
+    | boolean[]
+    | string[];
+
+export interface GgufInspectResult {
+    /** GGUF format version (typically 3). */
+    version: number;
+    /** Tensor data alignment in bytes (typically 32). */
+    alignment: number;
+    /** Absolute byte offset where tensor data begins in the file. */
+    dataOffset: bigint;
+    /** Full GGUF KV pair map. Keys are like "general.architecture", "llama.embedding_length", etc. */
+    metadata: Record<string, GgufMetaValue>;
+    /** Tensor descriptors (no data loaded). */
+    tensors: GgufTensorInfo[];
+}
+
+export interface InspectOptions {
+    /**
+     * Use the in-process LRU cache (default `true`). Cached entries are keyed
+     * by canonical path and invalidated when the file's mtime or size changes.
+     */
+    cache?: boolean;
+}
+
+/**
+ * Read GGUF header, KV metadata, and tensor descriptors without loading any
+ * tensor weights. Useful for cheap model identification, shape inspection,
+ * or pre-flight validation before a full `LlamaModel` load.
+ *
+ * Results are memoized by canonical path (mtime + size validated). Pass
+ * `{ cache: false }` to bypass the cache, or call `clearInspectCache()` to
+ * flush it.
+ */
+export declare function inspect(path: string, opts?: InspectOptions): Promise<GgufInspectResult>;
+
+/** Flush the in-process `inspect()` memoization cache. */
+export declare function clearInspectCache(): void;

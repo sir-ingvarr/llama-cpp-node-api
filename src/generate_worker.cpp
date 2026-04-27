@@ -1,8 +1,13 @@
 #include "generate_worker.h"
+#include "addon_state.h"
 
 #include <algorithm>
+#include <cmath>
 #include <cstring>
+#include <limits>
+#include <memory>
 #include <stdexcept>
+#include <utility>
 
 // Returns the index past the last *complete* UTF-8 sequence in s.
 // Bytes in [result, s.size()) form an incomplete trailing sequence and
@@ -45,7 +50,9 @@ GenerateWorker::GenerateWorker(
     std::vector<std::string>          stop_sequences,
     std::vector<std::string>          grammar_trigger_patterns,
     std::vector<int32_t>              grammar_trigger_tokens,
-    std::vector<std::string>          preserved_tokens
+    std::vector<std::string>          preserved_tokens,
+    bool                              want_logprobs,
+    int32_t                           top_logprobs_n
 )
     : Napi::AsyncProgressQueueWorker<TokenChunk>(token_cb.Env()),
       owner_(owner),
@@ -64,7 +71,9 @@ GenerateWorker::GenerateWorker(
       stop_sequences_(std::move(stop_sequences)),
       grammar_trigger_patterns_(std::move(grammar_trigger_patterns)),
       grammar_trigger_tokens_(std::move(grammar_trigger_tokens)),
-      preserved_tokens_(std::move(preserved_tokens))
+      preserved_tokens_(std::move(preserved_tokens)),
+      want_logprobs_(want_logprobs),
+      top_logprobs_n_(top_logprobs_n)
 {
     token_cb_ = Napi::Persistent(token_cb);
     done_cb_  = Napi::Persistent(done_cb);
@@ -100,8 +109,9 @@ static size_t trailing_stop_prefix(
 // ---------------------------------------------------------------------------
 
 void GenerateWorker::Execute(const ExecutionProgress & progress) {
+    WorkerGuard guard(owner_->addon_state());
     // Fast-reject if cancelled while queued, before contending for the ctx mutex.
-    if (state_->cancel.load(std::memory_order_relaxed)) {
+    if (state_->cancel.load(std::memory_order_relaxed) || guard.shutting_down()) {
         return;
     }
 
@@ -112,7 +122,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         return;
     }
     // Recheck cancel after acquiring the mutex — may have been flipped while waiting.
-    if (state_->cancel.load(std::memory_order_relaxed)) {
+    if (state_->cancel.load(std::memory_order_relaxed) || guard.shutting_down()) {
         return;
     }
 
@@ -166,8 +176,12 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // Grammar must come FIRST so it zeros out non-grammatical tokens from the
     // full logit distribution before top-k/top-p/min-p can discard them.
     // Order mirrors llama.cpp's common_sampler "grammar_first" path.
-    llama_sampler * smpl =
-        llama_sampler_chain_init(llama_sampler_chain_default_params());
+    using SamplerPtr = std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)>;
+    SamplerPtr smpl_owner{
+        llama_sampler_chain_init(llama_sampler_chain_default_params()),
+        &llama_sampler_free
+    };
+    llama_sampler * smpl = smpl_owner.get();
 
     // 1. Grammar — constrain logits before any probability filtering.
     //    Triggers switch the sampler to "lazy" mode: grammar stays off until
@@ -232,6 +246,13 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     std::string pending;
     std::string utf8_carry;   // incomplete multi-byte sequence from previous chunk
 
+    // Per-token logprob snapshot, attached to whatever chunks emit() flushes
+    // before the next sample. With stop-sequence lookahead a chunk can span
+    // multiple sampled tokens; in that case only the most recent token's
+    // logprob rides along (documented contract).
+    float                                       cur_logprob = 0.0f;
+    std::vector<std::pair<std::string, float>>  cur_top;
+
     auto emit = [&](std::string text) {
         std::string full = utf8_carry + std::move(text);
         utf8_carry.clear();
@@ -243,6 +264,11 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         if (!full.empty()) {
             TokenChunk ch;
             ch.text = std::move(full);
+            if (want_logprobs_) {
+                ch.has_logprobs = true;
+                ch.logprob      = cur_logprob;
+                ch.top_logprobs = cur_top;
+            }
             progress.Send(&ch, 1);
         }
     };
@@ -255,7 +281,6 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         int ret = llama_decode(ctx, batch);
         if (ret == 2) { break; } // aborted via abort_callback
         if (ret != 0) {
-            llama_sampler_free(smpl);
             owner_->clear_active_request();
             SetError(std::string("llama_decode failed, ret=") +
                      std::to_string(ret));
@@ -274,10 +299,47 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
             break;
         }
 
+        // Compute logprobs for this token from the raw model logits BEFORE
+        // any sampler-stage filtering (so the user sees the model's
+        // distribution, not the post-grammar/penalty distribution).
+        if (want_logprobs_) {
+            const float * logits  = llama_get_logits_ith(ctx, -1);
+            const int     n_vocab = llama_vocab_n_tokens(vocab);
+            float max_logit = -std::numeric_limits<float>::infinity();
+            for (int i = 0; i < n_vocab; ++i) {
+                if (logits[i] > max_logit) max_logit = logits[i];
+            }
+            double sum = 0.0;
+            for (int i = 0; i < n_vocab; ++i) {
+                sum += std::exp((double)(logits[i] - max_logit));
+            }
+            const float lse = max_logit + (float) std::log(sum);
+            cur_logprob = logits[new_token_id] - lse;
+
+            cur_top.clear();
+            if (top_logprobs_n_ > 0) {
+                std::vector<std::pair<float, int>> idx;
+                idx.reserve((size_t) n_vocab);
+                for (int i = 0; i < n_vocab; ++i) idx.emplace_back(logits[i], i);
+                const int K = std::min(top_logprobs_n_, n_vocab);
+                std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
+                    [](const std::pair<float,int> & a,
+                       const std::pair<float,int> & b) { return a.first > b.first; });
+                cur_top.reserve((size_t) K);
+                for (int i = 0; i < K; ++i) {
+                    char tbuf[256];
+                    int tn = llama_token_to_piece(vocab, idx[i].second,
+                                                  tbuf, sizeof(tbuf), 0, true);
+                    std::string ttext = (tn > 0) ? std::string(tbuf, (size_t) tn)
+                                                 : std::string();
+                    cur_top.emplace_back(std::move(ttext), idx[i].first - lse);
+                }
+            }
+        }
+
         char buf[256];
         int n = llama_token_to_piece(vocab, new_token_id, buf, sizeof(buf), 0, true);
         if (n < 0) {
-            llama_sampler_free(smpl);
             owner_->clear_active_request();
             SetError("llama_token_to_piece failed");
             return;
@@ -337,16 +399,36 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         progress.Send(&ch, 1);
     }
 
-    llama_sampler_free(smpl);
     owner_->clear_active_request();
+    // smpl_owner releases the sampler chain on scope exit.
 }
 
 void GenerateWorker::OnProgress(const TokenChunk * chunks, size_t count) {
     Napi::Env env = token_cb_.Env();
     Napi::HandleScope scope(env);
+    // Token text is guaranteed-valid UTF-8 by complete_utf8_boundary(), so we
+    // hand it to V8 as a String — V8 can short-string-optimise and the JS side
+    // doesn't need to decode a Buffer per token. If the JS callback throws,
+    // bail out of the loop: with NAPI_DISABLE_CPP_EXCEPTIONS a pending
+    // exception silently neutralises subsequent N-API calls.
     for (size_t i = 0; i < count; ++i) {
-        const std::string & text = chunks[i].text;
-        token_cb_.Call({Napi::Buffer<char>::Copy(env, text.data(), text.size())});
+        const TokenChunk & ck = chunks[i];
+        Napi::String text = Napi::String::New(env, ck.text);
+        if (!ck.has_logprobs) {
+            token_cb_.Call({text});
+        } else {
+            // cb(text, logprob, topLogprobs) — JS layer assembles the object.
+            Napi::Number lp = Napi::Number::New(env, (double) ck.logprob);
+            Napi::Array  top = Napi::Array::New(env, ck.top_logprobs.size());
+            for (size_t j = 0; j < ck.top_logprobs.size(); ++j) {
+                Napi::Object e = Napi::Object::New(env);
+                e.Set("token",   Napi::String::New(env, ck.top_logprobs[j].first));
+                e.Set("logprob", Napi::Number::New(env, (double) ck.top_logprobs[j].second));
+                top.Set((uint32_t) j, e);
+            }
+            token_cb_.Call({text, lp, top});
+        }
+        if (env.IsExceptionPending()) return;
     }
 }
 
