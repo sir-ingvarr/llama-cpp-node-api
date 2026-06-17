@@ -43,7 +43,15 @@ void LoadWorker::OnOK() {
         env, handle_,
         [](Napi::Env, LoadHandle * h) {
             if (h && h->model) {
-                llama_model_free(h->model);
+                // If the env is tearing down, the backend may already be (or is
+                // about to be) freed; calling llama_model_free now would race
+                // llama_backend_free. The process/env is dying, so leak the
+                // model rather than risk a use-after-free.
+                const bool teardown = h->state &&
+                    h->state->shutting_down.load(std::memory_order_acquire);
+                if (!teardown) {
+                    llama_model_free(h->model);
+                }
             }
             delete h;
         });
@@ -76,6 +84,7 @@ static Napi::Value LoadModel(const Napi::CallbackInfo & info) {
     Napi::Function done = info[2].As<Napi::Function>();
 
     auto * handle = new LoadHandle();
+    handle->state = env.GetInstanceData<AddonState>();
     if (opts.Has("nGpuLayers") && opts.Get("nGpuLayers").IsNumber()) {
         handle->n_gpu_layers = opts.Get("nGpuLayers").As<Napi::Number>().Int32Value();
     }

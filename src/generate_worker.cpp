@@ -276,6 +276,10 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // logprob rides along (documented contract).
     float                                       cur_logprob = 0.0f;
     std::vector<std::pair<std::string, float>>  cur_top;
+    // Scratch for top-K selection, reused across tokens. Declared outside the
+    // decode loop and clear()'d (not reallocated) each token so we don't churn
+    // a vocab-sized buffer (~1 MB at 128k vocab) on every sampled token.
+    std::vector<std::pair<float, int>>          logprob_scratch;
 
     auto emit = [&](std::string text) {
         std::string full = utf8_carry + std::move(text);
@@ -342,8 +346,9 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
 
             cur_top.clear();
             if (top_logprobs_n_ > 0) {
-                std::vector<std::pair<float, int>> idx;
-                idx.reserve((size_t) n_vocab);
+                auto & idx = logprob_scratch;
+                idx.clear();                       // retains capacity
+                idx.reserve((size_t) n_vocab);     // no-op after the first token
                 for (int i = 0; i < n_vocab; ++i) idx.emplace_back(logits[i], i);
                 const int K = std::min(top_logprobs_n_, n_vocab);
                 std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),

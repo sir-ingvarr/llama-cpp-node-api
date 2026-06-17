@@ -227,8 +227,11 @@ bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
     if (cache_type_v_ >= 0) {
         ctx_params.type_v = (enum ggml_type) cache_type_v_;
     }
-    if (flash_attn_type_ >= -1) {
-        // -1 (AUTO) is also a valid enum value, so always assign.
+    if (flash_attn_type_ >= -1 && flash_attn_type_ <= 1) {
+        // Valid enum range: -1 (AUTO), 0 (DISABLED), 1 (ENABLED). -1 is itself a
+        // valid value, so assign whenever in range. Out-of-range ints (e.g. from
+        // a direct native caller bypassing JS normalization) are ignored, leaving
+        // the default AUTO rather than casting garbage to the enum (UB).
         ctx_params.flash_attn_type = (enum llama_flash_attn_type) flash_attn_type_;
     }
     if (n_threads_ > 0) {
@@ -732,7 +735,13 @@ Napi::Value LlamaModel::Detokenize(const Napi::CallbackInfo & info) {
     uint32_t n = arr.Length();
     std::vector<llama_token> tokens(n);
     for (uint32_t i = 0; i < n; ++i) {
-        tokens[i] = arr.Get(i).As<Napi::Number>().Int32Value();
+        Napi::Value el = arr.Get(i);
+        if (!el.IsNumber()) {
+            Napi::TypeError::New(env, "detokenize: tokens must be an array of numbers")
+                .ThrowAsJavaScriptException();
+            return env.Undefined();
+        }
+        tokens[i] = el.As<Napi::Number>().Int32Value();
     }
 
     bool remove_special = false;

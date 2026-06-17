@@ -80,6 +80,16 @@ function createChannel() {
         [Symbol.asyncIterator]() {
             return {
                 next: () => new Promise((resolve, reject) => {
+                    // Single-consumer only: one pending next() at a time. A second
+                    // overlapping next() would clobber the first's resolver and
+                    // leave it hung forever, so reject loudly instead. The internal
+                    // `for await` drives this sequentially and never trips it.
+                    if (resolveNext) {
+                        reject(new Error(
+                            'createChannel: concurrent next() is not supported ' +
+                            '(the async iterator is single-consumer)'));
+                        return;
+                    }
                     resolveNext = resolve;
                     rejectNext  = reject;
                     deliver();
@@ -243,6 +253,10 @@ class LlamaModel {
      * If the consumer breaks/throws out of `for await (...)` early, the
      * underlying native request is automatically cancelled so the worker
      * thread doesn't keep decoding into a dead channel.
+     *
+     * No backpressure: tokens are queued as the model produces them and are not
+     * paused if the consumer is slow, so a slow `for await` body buffers the
+     * generation in memory. Drain promptly; do per-token async work elsewhere.
      *
      * @param {string} prompt
      * @param {import('./index').GenerateOptions} [opts]
@@ -435,6 +449,12 @@ class LlamaModel {
         const { messages, tools, toolChoice, parallelToolCalls,
                 enableThinking, jsonSchema, chatTemplateKwargs,
                 chatTemplateOverride, signal, stop,
+                // Pulled out and discarded: chat() buffers tokens into a single
+                // string, so per-token logprobs are meaningless here. If they
+                // reached generate() the yielded items would be objects, not
+                // strings, and `text += tok` would produce "[object Object]…".
+                // Use generate() directly when you need logprobs.
+                logprobs: _ignoredLogprobs, topLogprobs: _ignoredTopLogprobs,
                 ...generateOpts } = opts;
 
         const rendered = this.applyChatTemplateJinja(messages, {
@@ -632,6 +652,12 @@ class LlamaModelPool {
  * @returns {Promise<void>}
  */
 function quantize(inputPath, outputPath, opts) {
+    if (typeof inputPath !== 'string' || !inputPath) {
+        return Promise.reject(new TypeError('quantize: inputPath must be a non-empty string'));
+    }
+    if (typeof outputPath !== 'string' || !outputPath) {
+        return Promise.reject(new TypeError('quantize: outputPath must be a non-empty string'));
+    }
     if (!opts || (typeof opts.ftype !== 'string' && typeof opts.ftype !== 'number')) {
         return Promise.reject(new TypeError('quantize: opts.ftype is required (string name or enum value)'));
     }
@@ -684,6 +710,9 @@ function _inspectNative(realPath) {
  * @returns {Promise<import('./index').GgufInspectResult>}
  */
 async function inspect(path, opts = {}) {
+    if (typeof path !== 'string' || !path) {
+        throw new TypeError('inspect: path must be a non-empty string');
+    }
     const useCache = opts.cache !== false && INSPECT_CACHE_MAX > 0;
     const real     = await fs.promises.realpath(path);
 

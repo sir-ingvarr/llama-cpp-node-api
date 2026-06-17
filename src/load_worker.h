@@ -30,6 +30,10 @@ struct LoadHandle {
     // override defaults; the worker uses these directly.
     bool          use_mmap   = true;
     bool          use_mlock  = false;
+    // Per-env state, used only by the External finalizer to detect env teardown
+    // (so it can skip llama_model_free and avoid racing llama_backend_free).
+    // Non-owning; AddonState outlives the handle.
+    AddonState *  state      = nullptr;
 };
 
 // LoadWorker runs llama_model_load_from_file on a libuv worker thread so the
