@@ -16,20 +16,26 @@
 // ---------------------------------------------------------------------------
 
 Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
+    // NOTE: use the runtime (non-template) InstanceMethod/InstanceAccessor
+    // overloads — pass the method pointer as an argument, not as a template
+    // parameter. The templated `InstanceMethod<&Method>` form triggers an MSVC
+    // Internal Compiler Error (C1001) in node-addon-api's constexpr property
+    // descriptor path on recent VS 2022 toolsets. Do NOT "modernize" these back
+    // to the <&Method> form — it breaks the Windows build.
     Napi::Function func = DefineClass(env, "LlamaModel", {
-        InstanceMethod<&LlamaModel::Generate>("generate"),
-        InstanceMethod<&LlamaModel::Abort>("abort"),
-        InstanceMethod<&LlamaModel::AbortRequest>("abortRequest"),
-        InstanceMethod<&LlamaModel::Dispose>("dispose"),
-        InstanceAccessor<&LlamaModel::ContextLength>("contextLength"),
-        InstanceAccessor<&LlamaModel::ChatTemplate>("chatTemplate"),
-        InstanceMethod<&LlamaModel::ApplyChatTemplate>("applyChatTemplate"),
-        InstanceMethod<&LlamaModel::ApplyChatTemplateJinja>("applyChatTemplateJinja"),
-        InstanceMethod<&LlamaModel::ParseChatResponse>("parseChatResponse"),
-        InstanceMethod<&LlamaModel::Tokenize>("tokenize"),
-        InstanceMethod<&LlamaModel::Detokenize>("detokenize"),
-        InstanceMethod<&LlamaModel::GetModelInfo>("getModelInfo"),
-        InstanceMethod<&LlamaModel::Embed>("embed"),
+        InstanceMethod("generate", &LlamaModel::Generate),
+        InstanceMethod("abort", &LlamaModel::Abort),
+        InstanceMethod("abortRequest", &LlamaModel::AbortRequest),
+        InstanceMethod("dispose", &LlamaModel::Dispose),
+        InstanceAccessor("contextLength", &LlamaModel::ContextLength, nullptr),
+        InstanceAccessor("chatTemplate", &LlamaModel::ChatTemplate, nullptr),
+        InstanceMethod("applyChatTemplate", &LlamaModel::ApplyChatTemplate),
+        InstanceMethod("applyChatTemplateJinja", &LlamaModel::ApplyChatTemplateJinja),
+        InstanceMethod("parseChatResponse", &LlamaModel::ParseChatResponse),
+        InstanceMethod("tokenize", &LlamaModel::Tokenize),
+        InstanceMethod("detokenize", &LlamaModel::Detokenize),
+        InstanceMethod("getModelInfo", &LlamaModel::GetModelInfo),
+        InstanceMethod("embed", &LlamaModel::Embed),
     });
 
     // Note: no SetInstanceData here — the env's instance-data slot is reserved
