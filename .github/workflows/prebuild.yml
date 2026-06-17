@@ -10,6 +10,9 @@ permissions:
   id-token: write
 
 jobs:
+  # Build the native binary on every target platform and upload it as an
+  # artifact. NOTHING is published here — a failure on any platform must
+  # prevent the whole release (see the `publish` job's `needs: build`).
   build:
     strategy:
       fail-fast: false
@@ -38,7 +41,6 @@ jobs:
       - uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
 
       - name: Install dependencies (skip native build)
         run: npm install --ignore-scripts
@@ -46,38 +48,30 @@ jobs:
       - name: Build native module
         run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
 
-      - name: Copy binary into platform package
+      - name: Stage binary for upload
         shell: bash
         run: |
+          set -euo pipefail
           NODE_FILE=$(find build -name "llama_node.node" -type f | head -1)
           if [ -z "$NODE_FILE" ]; then
             echo "::error::Could not find llama_node.node"
             exit 1
           fi
-          PKG_DIR="npm/${{ matrix.platform }}-${{ matrix.arch }}"
-          cp "$NODE_FILE" "${PKG_DIR}/llama_node.node"
+          mkdir -p artifact
+          cp "$NODE_FILE" artifact/llama_node.node
 
-      - name: Publish platform package
-        shell: bash
-        run: npm publish --access public --provenance
-        working-directory: npm/${{ matrix.platform }}-${{ matrix.arch }}
-
-      - name: Package tarball for GitHub release
-        shell: bash
-        run: |
-          PACKAGE_VERSION=$(node -p "require('./package.json').version")
-          mkdir -p staging/build/Release
-          cp "npm/${{ matrix.platform }}-${{ matrix.arch }}/llama_node.node" staging/build/Release/
-          TARBALL="llama-cpp-node-api-v${PACKAGE_VERSION}-napi-v8-${{ matrix.platform }}-${{ matrix.arch }}.tar.gz"
-          tar -czf "${TARBALL}" -C staging build/Release/llama_node.node
-          echo "TARBALL=${TARBALL}" >> "$GITHUB_ENV"
-
-      - name: Upload to GitHub release
-        uses: softprops/action-gh-release@v2
+      - name: Upload binary artifact
+        uses: actions/upload-artifact@v4
         with:
-          files: ${{ env.TARBALL }}
-          draft: false
+          name: binary-${{ matrix.platform }}-${{ matrix.arch }}
+          path: artifact/llama_node.node
+          if-no-files-found: error
+          retention-days: 1
 
+  # Runs only if ALL four build jobs succeeded. Publishes every platform
+  # package + the meta package and creates the single GitHub release.
+  # Because this is one job, there is no race to create the release, and
+  # because it `needs: build`, a partial build never publishes anything.
   publish:
     needs: build
     runs-on: ubuntu-latest
@@ -92,5 +86,47 @@ jobs:
           node-version: 24
           registry-url: https://registry.npmjs.org
 
+      - name: Download all platform binaries
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Stage binaries into packages and build release tarballs
+        shell: bash
+        run: |
+          set -euo pipefail
+          PACKAGE_VERSION=$(node -p "require('./package.json').version")
+          echo "PACKAGE_VERSION=${PACKAGE_VERSION}" >> "$GITHUB_ENV"
+          mkdir -p release
+          for triple in darwin-arm64 darwin-x64 linux-x64 win32-x64; do
+            SRC="artifacts/binary-${triple}/llama_node.node"
+            if [ ! -f "$SRC" ]; then
+              echo "::error::Missing binary for ${triple} — refusing to publish a partial release"
+              exit 1
+            fi
+            cp "$SRC" "npm/${triple}/llama_node.node"
+            mkdir -p staging/build/Release
+            cp "$SRC" staging/build/Release/llama_node.node
+            tar -czf "release/llama-cpp-node-api-v${PACKAGE_VERSION}-napi-v8-${triple}.tar.gz" \
+              -C staging build/Release/llama_node.node
+            rm -rf staging
+          done
+
+      - name: Publish platform packages
+        shell: bash
+        run: |
+          set -euo pipefail
+          for triple in darwin-arm64 darwin-x64 linux-x64 win32-x64; do
+            echo "Publishing @llama-cpp-node-api/${triple}"
+            ( cd "npm/${triple}" && npm publish --access public --provenance )
+          done
+
       - name: Publish meta package
         run: npm publish --access public --provenance
+
+      - name: Create GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: release/*.tar.gz
+          draft: false
+          fail_on_unmatched_files: true
