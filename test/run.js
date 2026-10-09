@@ -2,13 +2,10 @@
 // Test entry point: resolves the functional-test model path, then spawns
 // `node --test`.
 //
-// Model path resolution order:
-//   1. LLAMA_NODE_MODEL_PATH environment variable
-//   2. test/.model-path cache file (written after a successful prompt)
-//   3. interactive prompt (works from a git hook too — reads /dev/tty)
-//
-// An empty answer at the prompt (or no terminal, e.g. CI) runs the suite
-// with the functional tests self-skipped.
+// The model path comes from LLAMA_NODE_MODEL_PATH; when unset, you are
+// asked for it (the prompt reads /dev/tty, so it also works from a git
+// hook). Nothing is ever persisted. An empty answer — or no terminal,
+// e.g. CI — runs the suite with the functional tests self-skipped.
 //
 // Usage: node test/run.js [unit|functional]
 'use strict';
@@ -18,19 +15,6 @@ const fs = require('fs');
 const path = require('path');
 
 const ENV_VAR = 'LLAMA_NODE_MODEL_PATH';
-const CACHE_FILE = path.join(__dirname, '.model-path');
-
-function readCache() {
-    try {
-        const p = fs.readFileSync(CACHE_FILE, 'utf8').trim();
-        if (p && fs.existsSync(p)) return p;
-    } catch (_) {}
-    return null;
-}
-
-function writeCache(p) {
-    try { fs.writeFileSync(CACHE_FILE, p + '\n'); } catch (_) {}
-}
 
 // Prompt on the controlling terminal. In a git hook stdin is not a TTY,
 // but /dev/tty still reaches the user's terminal.
@@ -69,12 +53,6 @@ async function resolveModelPath() {
         return fromEnv;
     }
 
-    const cached = readCache();
-    if (cached) {
-        console.error(`Using cached model path: ${cached}  (from test/.model-path)`);
-        return cached;
-    }
-
     const answer = await prompt(
         `${ENV_VAR} is not set.\n` +
         'Absolute path to a GGUF model for the functional tests\n' +
@@ -87,7 +65,6 @@ async function resolveModelPath() {
         console.error(`Not an existing absolute path: ${answer}`);
         process.exit(1);
     }
-    writeCache(answer);
     return answer;
 }
 

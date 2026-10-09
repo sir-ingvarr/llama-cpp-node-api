@@ -28,7 +28,11 @@ jobs:
           - os: macos-latest-large
             platform: darwin
             arch: x64
-          - os: ubuntu-latest
+          # Pinned (not ubuntu-latest): the published linux binary's minimum
+          # glibc comes from the build image. ubuntu-latest migrates to
+          # Ubuntu 26 from 2026-10-19, which would silently raise the glibc
+          # floor for everyone installing the prebuild. Bump deliberately.
+          - os: ubuntu-24.04
             platform: linux
             arch: x64
           - os: windows-latest

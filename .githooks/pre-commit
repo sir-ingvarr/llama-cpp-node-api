@@ -2,7 +2,7 @@
 # Runs the full test suite (unit + functional) before each commit.
 #
 # The functional suite needs a local GGUF model: set LLAMA_NODE_MODEL_PATH,
-# or answer the prompt once — the path is cached in test/.model-path.
+# or answer the prompt (press Enter to skip the functional tests).
 #
 # Bypass for a single commit:  git commit --no-verify   (or SKIP_TESTS=1)
 # Install:                     npm run hooks:install

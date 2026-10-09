@@ -45,7 +45,7 @@ history lives in the git log.
   suppress (empty for most text models; useful as `logitBias` bans).
 - **Test suite.** `npm test` runs unit tests (no model required) and
   functional tests against a real model — set `LLAMA_NODE_MODEL_PATH` or
-  answer the prompt once. `npm run hooks:install` adds a pre-commit hook that
+  answer the prompt. `npm run hooks:install` adds a pre-commit hook that
   runs the suite; unit tests also run on every platform in the release
   pipeline before anything is published. A `smoke_features.js` demo script
   covers the new features end to end.

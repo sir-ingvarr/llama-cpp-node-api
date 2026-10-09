@@ -159,9 +159,10 @@ Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD
 
 `node:test`-based, zero dependencies. `npm test` runs everything via
 `test/run.js`, which resolves the functional-test model path from
-`LLAMA_NODE_MODEL_PATH` → `test/.model-path` cache → interactive prompt
-(reads `/dev/tty`, so it works from the pre-commit hook; silently skips
-functional when there is no terminal, e.g. CI).
+`LLAMA_NODE_MODEL_PATH`, falling back to an interactive prompt (reads
+`/dev/tty`, so it works from the pre-commit hook; silently skips
+functional when there is no terminal, e.g. CI). Nothing is persisted —
+export the env var in your shell profile to avoid the prompt.
 
 ```bash
 npm run test:unit         # no model needed — runs in CI on every platform

@@ -22,4 +22,3 @@ vendor/llama.cpp/build/
 
 # Local planning notes
 FEATURE_IDEAS.md
-test/.model-path
