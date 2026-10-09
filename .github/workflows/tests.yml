@@ -1,0 +1,54 @@
+# Per-push unit-test status (the README "Tests" badge). Triggered by the
+# Build workflow finishing; reuses its compiled binary instead of building
+# again. Unit tests need no model file. The functional suite runs locally
+# via the pre-commit hook (see test/run.js), and unit tests additionally
+# run on all four platforms in prebuild.yml before a release.
+name: Tests
+
+on:
+  workflow_run:
+    workflows: [Build]
+    types: [completed]
+
+permissions:
+  contents: read
+  actions: read
+
+jobs:
+  unit:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Fail when the build failed
+        if: github.event.workflow_run.conclusion != 'success'
+        run: |
+          echo "::error::Build concluded '${{ github.event.workflow_run.conclusion }}' — tests cannot run."
+          exit 1
+
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ github.event.workflow_run.head_sha }}
+          # Tests load the prebuilt binary — no need for the vendor tree.
+          submodules: false
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies (skip native build)
+        run: npm install --ignore-scripts
+
+      - name: Remove prebuilt binaries so tests load the CI-built binary
+        run: rm -rf node_modules/@llama-cpp-node-api
+
+      - name: Download the binary built by the Build workflow
+        uses: actions/download-artifact@v8
+        with:
+          name: ci-binary
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+          path: build/Release
+
+      - name: Run unit tests
+        run: npm run test:unit

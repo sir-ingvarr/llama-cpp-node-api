@@ -29,6 +29,24 @@ void LoadWorker::Execute() {
         SetError(std::string("Failed to load model: ") + path_);
         return;
     }
+
+    // LoRA adapters load here too — adapter init reads tensor files and can
+    // take a while, so it belongs on the worker thread with the model load.
+    for (const auto & [lpath, scale] : handle_->lora_specs) {
+        llama_adapter_lora * adapter =
+            llama_adapter_lora_init(handle_->model, lpath.c_str());
+        if (!adapter) {
+            // Loaded adapters are owned by the model; freeing it frees them.
+            llama_model_free(handle_->model);
+            handle_->model = nullptr;
+            handle_->loras.clear();
+            handle_->lora_scales.clear();
+            SetError(std::string("Failed to load LoRA adapter: ") + lpath);
+            return;
+        }
+        handle_->loras.push_back(adapter);
+        handle_->lora_scales.push_back(scale);
+    }
 }
 
 void LoadWorker::OnOK() {
@@ -111,18 +129,8 @@ static Napi::Value LoadModel(const Napi::CallbackInfo & info) {
     if (opts.Has("nThreadsBatch") && opts.Get("nThreadsBatch").IsNumber()) {
         handle->n_threads_batch = opts.Get("nThreadsBatch").As<Napi::Number>().Int32Value();
     }
-    bool has_load_opt = false;
-    bool use_mmap     = true;
-    bool use_mlock    = false;
-    if (opts.Has("useMmap") && opts.Get("useMmap").IsBoolean()) {
-        use_mmap     = opts.Get("useMmap").As<Napi::Boolean>().Value();
-        has_load_opt = true;
-    }
-    if (opts.Has("useMlock") && opts.Get("useMlock").IsBoolean()) {
-        use_mlock    = opts.Get("useMlock").As<Napi::Boolean>().Value();
-        has_load_opt = true;
-    }
-    handle->load_mode = ResolveLoadMode(has_load_opt, use_mmap, use_mlock);
+    handle->load_mode  = ResolveLoadModeFromOpts(opts);
+    handle->lora_specs = ParseLoraSpecs(opts);
 
     auto * worker = new LoadWorker(done, std::move(path), handle);
     worker->Queue();

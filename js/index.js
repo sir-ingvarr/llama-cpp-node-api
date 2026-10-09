@@ -133,6 +133,17 @@ const FLASH_ATTN_TYPES = {
     on:   1,
 };
 
+// Mirror llama.h's enum llama_load_mode. The string surface supersedes the
+// boolean useMmap/useMlock pair (which remains supported).
+const LOAD_MODES = {
+    'auto':       -1,
+    'none':        0,
+    'mmap':        1,
+    'mlock':       2,
+    'mmap+mlock':  3,
+    'directio':    4,
+};
+
 // Mirror ggml.h's enum ggml_type values for the KV-cache-eligible subset
 // (matches llama.cpp's `kv_cache_types` allowlist in common/arg.cpp).
 const CACHE_TYPES = {
@@ -184,6 +195,28 @@ function normalizeModelOpts(opts) {
                 `Valid: ${Object.keys(FLASH_ATTN_TYPES).join(', ')}`);
         }
         out = { ...out, flashAttention: code };
+    }
+    if (typeof opts.loadMode === 'string') {
+        const code = LOAD_MODES[opts.loadMode.toLowerCase()];
+        if (code === undefined) {
+            throw new TypeError(
+                `LlamaModel: unknown loadMode '${opts.loadMode}'. ` +
+                `Valid: ${Object.keys(LOAD_MODES).join(', ')}`);
+        }
+        out = { ...out, loadMode: code };
+    }
+    if (opts.loras !== undefined) {
+        if (!Array.isArray(opts.loras)) {
+            throw new TypeError('LlamaModel: loras must be an array of paths or { path, scale } objects');
+        }
+        const loras = opts.loras.map(l => {
+            if (typeof l === 'string') return { path: l, scale: 1.0 };
+            if (l && typeof l === 'object' && typeof l.path === 'string') {
+                return { path: l.path, scale: typeof l.scale === 'number' ? l.scale : 1.0 };
+            }
+            throw new TypeError('LlamaModel: each lora must be a path string or { path, scale }');
+        });
+        out = { ...out, loras };
     }
     return out;
 }
@@ -449,6 +482,7 @@ class LlamaModel {
         const { messages, tools, toolChoice, parallelToolCalls,
                 enableThinking, jsonSchema, chatTemplateKwargs,
                 chatTemplateOverride, signal, stop,
+                reasoningBudget, reasoningBudgetMessage,
                 // Pulled out and discarded: chat() buffers tokens into a single
                 // string, so per-token logprobs are meaningless here. If they
                 // reached generate() the yielded items would be objects, not
@@ -478,6 +512,21 @@ class LlamaModel {
             if (rendered.grammarTriggerPatterns) genOpts.grammarTriggerPatterns = rendered.grammarTriggerPatterns;
             if (rendered.grammarTriggerTokens)   genOpts.grammarTriggerTokens   = rendered.grammarTriggerTokens;
             if (rendered.preservedTokens)        genOpts.preservedTokens        = rendered.preservedTokens;
+        }
+        // Reasoning budget: cap tokens inside the template's thinking block.
+        // Needs the template-detected tags; silently skipped when the
+        // template has none (the model doesn't emit thinking blocks anyway).
+        if (typeof reasoningBudget === 'number' && reasoningBudget >= 0 &&
+            rendered.thinkingStartTag && rendered.thinkingEndTags?.length) {
+            genOpts.reasoningBudget         = Math.floor(reasoningBudget);
+            genOpts.reasoningBudgetStartTag = rendered.thinkingStartTag;
+            genOpts.reasoningBudgetEndTags  = rendered.thinkingEndTags;
+            if (typeof reasoningBudgetMessage === 'string') {
+                genOpts.reasoningBudgetMessage = reasoningBudgetMessage;
+            }
+            if (rendered.generationPrompt) {
+                genOpts.reasoningBudgetPrefill = rendered.generationPrompt;
+            }
         }
 
         let text = '';
@@ -551,6 +600,55 @@ class LlamaModel {
             this.#native.embed(text, (err, vec) => {
                 if (err) reject(err);
                 else     resolve(vec);
+            });
+        });
+    }
+
+    /**
+     * Save the current context state (KV cache + RNG + logits) to a file via
+     * `llama_state_save_file`. Requires a live context (i.e. at least one
+     * generation has run). Pass the prompt tokens that produced the state
+     * (from `model.tokenize()`) to store them in the file — `loadState`
+     * returns them so you can skip re-prefilling.
+     *
+     * State files are NOT portable across llama.cpp versions, models, or
+     * context configurations.
+     *
+     * @param {string} path
+     * @param {{ tokens?: number[] }} [opts]
+     * @returns {Promise<void>}
+     */
+    saveState(path, opts = {}) {
+        this.#assertLive();
+        if (typeof path !== 'string' || !path) {
+            return Promise.reject(new TypeError('saveState: path must be a non-empty string'));
+        }
+        const tokens = Array.isArray(opts.tokens) ? opts.tokens : [];
+        return new Promise((resolve, reject) => {
+            this.#native.saveState(path, tokens, err => {
+                if (err) reject(err);
+                else     resolve();
+            });
+        });
+    }
+
+    /**
+     * Restore a context state previously written by `saveState`. Creates the
+     * context if none exists yet. Resolves with the token list stored in the
+     * file (empty if none was supplied on save).
+     *
+     * @param {string} path
+     * @returns {Promise<number[]>}
+     */
+    loadState(path) {
+        this.#assertLive();
+        if (typeof path !== 'string' || !path) {
+            return Promise.reject(new TypeError('loadState: path must be a non-empty string'));
+        }
+        return new Promise((resolve, reject) => {
+            this.#native.loadState(path, (err, tokens) => {
+                if (err) reject(err);
+                else     resolve(tokens);
             });
         });
     }
@@ -747,6 +845,11 @@ function clearInspectCache() {
     _inspectCache.clear();
 }
 
+/** Upstream llama.cpp version string (e.g. "0.6.0"), for diagnostics. */
+function llamaVersion() {
+    return addon.llamaVersion();
+}
+
 // ---------------------------------------------------------------------------
 
-module.exports = { LlamaModel, LlamaModelPool, quantize, quantizeFtypes, inspect, clearInspectCache };
+module.exports = { LlamaModel, LlamaModelPool, quantize, quantizeFtypes, inspect, clearInspectCache, llamaVersion };

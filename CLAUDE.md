@@ -78,6 +78,8 @@ src/inspect_worker.cpp/.h     ← AsyncWorker: gguf_init_from_file (no_alloc) �
 src/load_worker.cpp/.h        ← AsyncWorker: llama_model_load_from_file off the JS thread,
                                  hands the loaded model to JS via External<LoadHandle>
 src/embed_worker.cpp/.h       ← AsyncWorker: llama_decode in embedding mode + Float32Array marshaling
+src/state_worker.cpp/.h       ← AsyncWorkers: llama_state_save_file / _load_file under ctx_mutex_
+                                 (also implements LlamaModel::SaveState/LoadState JS entry points)
 src/chat_templates.cpp        ← libcommon Jinja renderer + chat-response parser
                                  (applyChatTemplateJinja, parseChatResponse)
 vendor/llama.cpp/             ← git submodule (pinned commit)
@@ -116,7 +118,13 @@ Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD
 
 - **Lazy grammar** — `GenerateWorker` branches on `grammarTriggerPatterns` / `grammarTriggerTokens`: if either is non-empty, uses `llama_sampler_init_grammar_lazy_patterns()` (grammar activates only after a trigger appears in the output); else uses eager `llama_sampler_init_grammar()`. Backward-compatible: existing callers passing only `grammar` see no behavioural change. Trigger conversion from libcommon's typed `common_grammar_trigger` mirrors `common/sampling.cpp` (regex_escape words, anchor PATTERN_FULL patterns, TOKEN triggers go to the separate token-array argument).
 
-- **Sampler chain order** — logit_bias → grammar → penalties → top_k → top_p → min_p → temperature → dist. Grammar must come before the probability filters so it can zero out non-grammatical tokens before they're discarded for low probability. `logitBias` is added **before** grammar so a positive bias on a grammar-disallowed token cannot resurrect it (grammar masks to -inf afterward and has the final say). `seed` (default `-1` → `LLAMA_DEFAULT_SEED`) feeds the final `dist` sampler.
+- **Sampler chain order** — reasoning_budget → logit_bias → grammar → penalties → dry → top_n_sigma → top_k → typical → top_p → min_p → xtc → temp/temp_ext → dist-or-adaptive_p (mirrors upstream `common_sampler`). When `mirostat` is 1/2 the filter stack is replaced: … → grammar → temp → mirostat. Grammar must come before the probability filters so it can zero out non-grammatical tokens before they're discarded for low probability. `logitBias` is added **before** grammar so a positive bias on a grammar-disallowed token cannot resurrect it (grammar masks to -inf afterward and has the final say). `seed` (default `-1` → `LLAMA_DEFAULT_SEED`) feeds dist/xtc/mirostat/adaptive-p. All generation options travel in a single `GenerateParams` struct (generate_worker.h) — don't grow the worker ctor again.
+
+- **Reasoning budget** — `common_reasoning_budget_init` (libcommon) sampler added FIRST in the chain when `reasoningBudget >= 0` and both tags are set; it forces the end tag by masking all other logits, so combining it with an *eager* grammar is unsupported (lazy tool-call grammars are fine — they trigger after the block closes). Tags come from `common_chat_params.thinking_start_tag/thinking_end_tags`, surfaced by `applyChatTemplateJinja` as `thinkingStartTag`/`thinkingEndTags`; `chat()` wires them automatically and also passes `generationPrompt` as `reasoningBudgetPrefill` so a template that pre-opens `<think>` starts counting immediately (mirrors upstream's prefill accept, incl. the leading-space-token skip).
+
+- **LoRA adapters** — `loras: [{path, scale}]` model-load option. Adapters load with the model (`llama_adapter_lora_init`; on the worker thread in `LoadWorker::Execute`, sync in the ctor) and are applied to every new context in `EnsureContext` via `llama_set_adapters_lora`. No manual free: llama.cpp frees adapters with the model.
+
+- **Session state** — `saveState(path, {tokens})` / `loadState(path)` (state_worker.cpp) wrap `llama_state_save_file/_load_file` under `ctx_mutex_`. Save requires a live ctx; load creates one via `PrepareContextLocked(n_ctx_default, reset=false)`. The token list is llama.cpp's session-token convention (caller supplies via `tokenize()`, gets it back on load); files are version/model/ctx-config specific.
 
 - **`js/index.js`** — Bridges the native callback API to an async generator. Reads `grammarFile` asynchronously (`fs.promises.readFile`) before the native call. Wires `opts.signal` (AbortSignal) to `native.abortRequest(id)`. Exports `LlamaModel`, `LlamaModelPool`, `quantize`, `quantizeFtypes`, `inspect`, `clearInspectCache`. `LlamaModel.load(path, opts)` is the async factory — calls `addon.loadModel`, then constructs the JS-side instance with the External handle so the C++ ctor skips the sync load. `LlamaModel.chat(opts)` is a one-shot helper that bundles `applyChatTemplateJinja` → `generate` → `parseChatResponse`, buffering tokens and returning `{ content, reasoningContent, toolCalls[], format, raw }`. No streaming variant yet — for streaming, use `generate()` directly. `model.embed(text)` returns `Promise<Float32Array>` and throws if not constructed with `embeddings: true`. JS-side `normalizeModelOpts()` converts string `poolingType` (`'mean'`, `'cls'`, …) to the `llama_pooling_type` enum int before reaching native.
 
@@ -147,12 +155,34 @@ Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD
 - **cmake-js `--CD`**: does not forward `-D` variables to cmake configure. Use environment variables instead.
 - **Cross-compilation**: cmake-js sets `CMAKE_OSX_ARCHITECTURES=arm64` while the host may report `x86_64`, making `-mcpu=native` invalid. `GGML_NATIVE=OFF` is forced in vendor mode to prevent this.
 
+## Tests
+
+`node:test`-based, zero dependencies. `npm test` runs everything via
+`test/run.js`, which resolves the functional-test model path from
+`LLAMA_NODE_MODEL_PATH` → `test/.model-path` cache → interactive prompt
+(reads `/dev/tty`, so it works from the pre-commit hook; silently skips
+functional when there is no terminal, e.g. CI).
+
+```bash
+npm run test:unit         # no model needed — runs in CI on every platform
+                          # in the prebuild matrix, gating publish
+npm run test:functional   # real model; text-quality + grammar + feature coverage
+npm run hooks:install     # sets core.hooksPath=.githooks (pre-commit runs npm test)
+```
+
+Optional env: `LLAMA_NODE_LORA_PATH` enables the positive LoRA test.
+Unit tests include a hand-crafted minimal GGUF fixture that exercises the
+full `inspect()` pipeline without a model — keep it in sync if the GGUF
+header layout ever changes upstream.
+
 ## Smoke tests
 
 ```bash
 node smoke.js              /path/to/model.gguf    # sampling + pool
 node smoke_concurrent.js   /path/to/model.gguf    # queue + abort semantics
 node smoke_chat_jinja.js   /path/to/model.gguf    # Jinja templates + tools + chat()
+node smoke_features.js     /path/to/model.gguf    # new samplers + state save/load +
+                                                  # reasoning budget + loadMode + LoRA plumbing
 ```
 
 `smoke.js` covers baseline generation, minP, repeatPenalty, stop sequences, and `LlamaModelPool`.

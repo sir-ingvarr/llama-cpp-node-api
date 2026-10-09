@@ -7,6 +7,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Changelog entries start at the llama.cpp v0.6.0 upgrade (2026-10-09); earlier
 history lives in the git log.
 
+## [0.15.0] - 2026-10-09
+
+### Added
+
+- **LoRA adapters.** Pass `loras: ['adapter.gguf']` (or `{ path, scale }`
+  objects) when loading a model to blend one or more LoRA adapters into
+  generation. Works with both `new LlamaModel()` and the async
+  `LlamaModel.load()`.
+- **More sampling strategies** in `generate()`, all opt-in — existing calls
+  behave exactly as before:
+  - typical-p: `typicalP`
+  - XTC: `xtcProbability`, `xtcThreshold`
+  - top-n-sigma: `topNSigma`
+  - DRY repetition penalty: `dryMultiplier`, `dryBase`, `dryAllowedLength`,
+    `dryPenaltyLastN`, `drySequenceBreakers`
+  - Mirostat v1/v2: `mirostat`, `mirostatTau`, `mirostatEta`
+  - dynamic temperature: `dynatempRange`, `dynatempExponent`
+  - adaptive-p: `adaptivePTarget`, `adaptivePDecay`
+- **Reasoning budget for thinking models.** `chat({ reasoningBudget: 200 })`
+  caps how many tokens the model may spend inside its thinking block and
+  closes the block cleanly when the budget runs out (optionally injecting
+  `reasoningBudgetMessage` first). The thinking tags are detected from the
+  model's chat template automatically; `generate()` accepts the raw tag
+  options for template-free setups, and `applyChatTemplateJinja` now reports
+  the detected `thinkingStartTag` / `thinkingEndTags`.
+- **Conversation snapshots.** `model.saveState(path, { tokens })` and
+  `model.loadState(path)` save and restore the context state (KV cache), so
+  a long conversation can resume later without re-processing the whole
+  prompt. State files only load with the same model, context settings, and
+  llama.cpp version that wrote them.
+- **`loadMode` option** — finer control over how weights are loaded:
+  `'auto' | 'none' | 'mmap' | 'mlock' | 'mmap+mlock' | 'directio'`. The
+  existing `useMmap` / `useMlock` booleans keep working.
+- `llamaVersion()` — the bundled llama.cpp version string, for diagnostics.
+- `getModelInfo().suppressTokens` — tokens the model's metadata asks to
+  suppress (empty for most text models; useful as `logitBias` bans).
+- **Test suite.** `npm test` runs unit tests (no model required) and
+  functional tests against a real model — set `LLAMA_NODE_MODEL_PATH` or
+  answer the prompt once. `npm run hooks:install` adds a pre-commit hook that
+  runs the suite; unit tests also run on every platform in the release
+  pipeline before anything is published. A `smoke_features.js` demo script
+  covers the new features end to end.
+- README now carries live Build / Tests status badges and links to this
+  changelog, and GitHub release notes are generated from the matching
+  changelog section automatically.
+
+### Fixed
+
+- **Stop sequences are no longer missed mid-token.** When a single sampled
+  token contained a stop string in the middle (for example stopping on
+  `"\n"` while the model emits a `"\n\n"` token), the stop could leak into
+  the output. Output now ends exactly at the first stop occurrence.
+
 ## [0.14.0] - 2026-10-09
 
 ### Changed

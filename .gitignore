@@ -19,3 +19,7 @@ vendor/llama.cpp/build/
 *.node
 
 .cache
+
+# Local planning notes
+FEATURE_IDEAS.md
+test/.model-path

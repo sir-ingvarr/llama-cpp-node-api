@@ -46,6 +46,13 @@ static Napi::Object InitModule(Napi::Env env, Napi::Object exports) {
     RegisterQuantize(env, exports);
     RegisterInspect(env, exports);
     RegisterLoadModel(env, exports);
+
+    // llamaVersion() — upstream llama.cpp version string, for diagnostics.
+    exports.Set("llamaVersion", Napi::Function::New(env,
+        [](const Napi::CallbackInfo & info) -> Napi::Value {
+            return Napi::String::New(info.Env(), llama_version());
+        }, "llamaVersion"));
+
     return exports;
 }
 

@@ -368,6 +368,20 @@ Napi::Value LlamaModel::ApplyChatTemplateJinja(const Napi::CallbackInfo & info) 
         result.Set("additionalStops", arr);
     }
 
+    // Thinking-block delimiters detected by the auto parser (e.g. "<think>" /
+    // "</think>"). chat() forwards these into generate()'s reasoning-budget
+    // options when `reasoningBudget` is set.
+    if (!params.thinking_start_tag.empty()) {
+        result.Set("thinkingStartTag", Napi::String::New(env, params.thinking_start_tag));
+    }
+    if (!params.thinking_end_tags.empty()) {
+        Napi::Array arr = Napi::Array::New(env, params.thinking_end_tags.size());
+        for (size_t i = 0; i < params.thinking_end_tags.size(); ++i) {
+            arr.Set((uint32_t)i, Napi::String::New(env, params.thinking_end_tags[i]));
+        }
+        result.Set("thinkingEndTags", arr);
+    }
+
     return result;
 }
 

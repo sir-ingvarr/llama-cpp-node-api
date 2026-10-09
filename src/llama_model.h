@@ -7,6 +7,8 @@
 #include <mutex>
 #include <string>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "llama.h"
 
@@ -82,6 +84,10 @@ private:
     Napi::Value Detokenize(const Napi::CallbackInfo & info);
     Napi::Value GetModelInfo(const Napi::CallbackInfo & info);
     Napi::Value Embed(const Napi::CallbackInfo & info);
+    // Session-state persistence (llama_state_save_file / _load_file), run on
+    // a libuv worker serialized on ctx_mutex_. Implemented in state_worker.cpp.
+    Napi::Value SaveState(const Napi::CallbackInfo & info);
+    Napi::Value LoadState(const Napi::CallbackInfo & info);
 
     // Internal helpers
     bool EnsureContext(uint32_t n_ctx, std::string & error_out);
@@ -103,6 +109,11 @@ private:
     // -1 = leave llama_context_default_params() default (llama.cpp picks).
     int32_t              n_threads_       = -1;
     int32_t              n_threads_batch_ = -1;
+    // LoRA adapters loaded alongside the model (model-load option `loras`).
+    // The adapters are owned by the model (llama frees them with the model);
+    // applied to every context in EnsureContext via llama_set_adapters_lora.
+    std::vector<llama_adapter_lora *> loras_;
+    std::vector<float>                lora_scales_;
     AddonState *         state_     = nullptr;  // borrowed, owned by env
 
     std::mutex           ctx_mutex_;

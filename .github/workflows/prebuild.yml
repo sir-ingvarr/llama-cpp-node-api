@@ -52,6 +52,20 @@ jobs:
       - name: Build native module
         run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
 
+      # The loader prefers the published platform packages from
+      # optionalDependencies; drop them so the tests exercise the binary
+      # built above, not a previous release.
+      - name: Remove prebuilt binaries so tests load the fresh build
+        shell: bash
+        run: rm -rf node_modules/@llama-cpp-node-api
+
+      # Unit tests need no model file; they load the fresh addon and check
+      # the full JS/native surface. Publishing is gated on this via the
+      # publish job's `needs: build` — a failure on any platform blocks
+      # the release.
+      - name: Run unit tests
+        run: npm run test:unit
+
       - name: Stage binary for upload
         shell: bash
         run: |
@@ -120,6 +134,12 @@ jobs:
             rm -rf staging
           done
 
+      # Pull this version's section out of CHANGELOG.md for the release
+      # notes. Runs BEFORE any npm publish: a bumped version whose changelog
+      # section is missing fails the release while it is still a no-op.
+      - name: Extract release notes from CHANGELOG.md
+        run: node scripts/extract-changelog.js "$PACKAGE_VERSION" > release_notes.md
+
       - name: Publish platform packages
         shell: bash
         run: |
@@ -136,5 +156,6 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           files: release/*.tar.gz
+          body_path: release_notes.md
           draft: false
           fail_on_unmatched_files: true

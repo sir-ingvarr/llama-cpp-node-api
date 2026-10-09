@@ -6,6 +6,7 @@
 
 #include "chat.h"  // libcommon: common_chat_templates_free
 
+#include <algorithm>
 #include <cstdlib>
 #include <string>
 #include <utility>
@@ -36,6 +37,8 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("detokenize", &LlamaModel::Detokenize),
         InstanceMethod("getModelInfo", &LlamaModel::GetModelInfo),
         InstanceMethod("embed", &LlamaModel::Embed),
+        InstanceMethod("saveState", &LlamaModel::SaveState),
+        InstanceMethod("loadState", &LlamaModel::LoadState),
     });
 
     // Note: no SetInstanceData here — the env's instance-data slot is reserved
@@ -107,6 +110,8 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
         flash_attn_type_  = handle->flash_attn_type;
         n_threads_        = handle->n_threads;
         n_threads_batch_  = handle->n_threads_batch;
+        loras_            = std::move(handle->loras);
+        lora_scales_      = std::move(handle->lora_scales);
         vocab_         = llama_model_get_vocab(model_);
         return;
     }
@@ -127,18 +132,7 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     model_params.progress_callback = [](float, void *) { return true; };
-    bool has_load_opt = false;
-    bool use_mmap     = true;
-    bool use_mlock    = false;
-    if (opts.Has("useMmap") && opts.Get("useMmap").IsBoolean()) {
-        use_mmap     = opts.Get("useMmap").As<Napi::Boolean>().Value();
-        has_load_opt = true;
-    }
-    if (opts.Has("useMlock") && opts.Get("useMlock").IsBoolean()) {
-        use_mlock    = opts.Get("useMlock").As<Napi::Boolean>().Value();
-        has_load_opt = true;
-    }
-    model_params.load_mode = ResolveLoadMode(has_load_opt, use_mmap, use_mlock);
+    model_params.load_mode = ResolveLoadModeFromOpts(opts);
 
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model_) {
@@ -146,6 +140,23 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
             std::string("Failed to load model: ") + model_path)
             .ThrowAsJavaScriptException();
         return;
+    }
+
+    // LoRA adapters: load now (sync path mirrors the sync model load).
+    // Adapters are owned by the model — llama frees them with the model.
+    for (const auto & [lpath, scale] : ParseLoraSpecs(opts)) {
+        llama_adapter_lora * adapter =
+            llama_adapter_lora_init(model_, lpath.c_str());
+        if (!adapter) {
+            llama_model_free(model_);
+            model_ = nullptr;
+            Napi::Error::New(env,
+                std::string("Failed to load LoRA adapter: ") + lpath)
+                .ThrowAsJavaScriptException();
+            return;
+        }
+        loras_.push_back(adapter);
+        lora_scales_.push_back(scale);
     }
 
     vocab_ = llama_model_get_vocab(model_);
@@ -259,6 +270,17 @@ bool LlamaModel::EnsureContext(uint32_t n_ctx, std::string & error_out) {
         return false;
     }
 
+    // Attach LoRA adapters (if any) to the fresh context.
+    if (!loras_.empty()) {
+        if (llama_set_adapters_lora(ctx_, loras_.data(), loras_.size(),
+                                    lora_scales_.data()) != 0) {
+            llama_free(ctx_);
+            ctx_ = nullptr;
+            error_out = "llama_set_adapters_lora failed";
+            return false;
+        }
+    }
+
     n_ctx_ = n_ctx;
     return true;
 }
@@ -314,106 +336,100 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
     Napi::Function token_cb = info[2].As<Napi::Function>();
     Napi::Function done_cb  = info[3].As<Napi::Function>();
 
-    // Read options
-    int32_t  n_predict      = 256;
-    float    temperature    = 0.8f;
-    float    top_p          = 0.95f;
-    int32_t  top_k          = 40;
-    float    min_p          = 0.0f;
-    float    repeat_penalty = 1.0f;
-    int32_t  repeat_last_n  = 64;
-    uint32_t n_ctx          = n_ctx_;
-    std::string              grammar_str;
-    std::vector<std::string> stop_sequences;
-    std::vector<std::string> grammar_trigger_patterns;
-    std::vector<int32_t>     grammar_trigger_tokens;
-    std::vector<std::string> preserved_tokens;
+    // Read options into a GenerateParams snapshot (defaults in the struct).
+    GenerateParams gp;
+    gp.prompt = std::move(prompt);
+    gp.n_ctx  = n_ctx_;
 
-    if (opts.Has("nPredict") && opts.Get("nPredict").IsNumber()) {
-        n_predict = opts.Get("nPredict").As<Napi::Number>().Int32Value();
+    auto get_f32 = [&](const char * key, float & out) {
+        if (opts.Has(key) && opts.Get(key).IsNumber()) {
+            out = opts.Get(key).As<Napi::Number>().FloatValue();
+        }
+    };
+    auto get_i32 = [&](const char * key, int32_t & out) {
+        if (opts.Has(key) && opts.Get(key).IsNumber()) {
+            out = opts.Get(key).As<Napi::Number>().Int32Value();
+        }
+    };
+    auto get_str = [&](const char * key, std::string & out) {
+        if (opts.Has(key) && opts.Get(key).IsString()) {
+            out = opts.Get(key).As<Napi::String>().Utf8Value();
+        }
+    };
+    auto get_str_array = [&](const char * key, std::vector<std::string> & out) {
+        if (!opts.Has(key) || !opts.Get(key).IsArray()) return;
+        Napi::Array arr = opts.Get(key).As<Napi::Array>();
+        out.clear();
+        for (uint32_t i = 0; i < arr.Length(); ++i) {
+            Napi::Value v = arr.Get(i);
+            if (v.IsString()) {
+                out.push_back(v.As<Napi::String>().Utf8Value());
+            }
+        }
+    };
+
+    get_i32("nPredict",         gp.n_predict);
+    get_f32("temperature",      gp.temperature);
+    get_f32("dynatempRange",    gp.dynatemp_range);
+    get_f32("dynatempExponent", gp.dynatemp_exponent);
+    get_f32("topP",             gp.top_p);
+    get_i32("topK",             gp.top_k);
+    get_f32("minP",             gp.min_p);
+    get_f32("typicalP",         gp.typical_p);
+    get_f32("xtcProbability",   gp.xtc_probability);
+    get_f32("xtcThreshold",     gp.xtc_threshold);
+    get_f32("topNSigma",        gp.top_n_sigma);
+    get_f32("repeatPenalty",    gp.repeat_penalty);
+    get_i32("repeatLastN",      gp.repeat_last_n);
+    get_f32("dryMultiplier",    gp.dry_multiplier);
+    get_f32("dryBase",          gp.dry_base);
+    get_i32("dryAllowedLength", gp.dry_allowed_length);
+    get_i32("dryPenaltyLastN",  gp.dry_penalty_last_n);
+    get_str_array("drySequenceBreakers", gp.dry_sequence_breakers);
+    get_i32("mirostat",         gp.mirostat);
+    get_f32("mirostatTau",      gp.mirostat_tau);
+    get_f32("mirostatEta",      gp.mirostat_eta);
+    get_f32("adaptivePTarget",  gp.adaptive_p_target);
+    get_f32("adaptivePDecay",   gp.adaptive_p_decay);
+    if (gp.mirostat < 0 || gp.mirostat > 2) {
+        Napi::RangeError::New(env, "generate: mirostat must be 0, 1 or 2")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
     }
-    if (opts.Has("temperature") && opts.Get("temperature").IsNumber()) {
-        temperature = opts.Get("temperature").As<Napi::Number>().FloatValue();
-    }
-    if (opts.Has("topP") && opts.Get("topP").IsNumber()) {
-        top_p = opts.Get("topP").As<Napi::Number>().FloatValue();
-    }
-    if (opts.Has("topK") && opts.Get("topK").IsNumber()) {
-        top_k = opts.Get("topK").As<Napi::Number>().Int32Value();
-    }
-    if (opts.Has("minP") && opts.Get("minP").IsNumber()) {
-        min_p = opts.Get("minP").As<Napi::Number>().FloatValue();
-    }
-    if (opts.Has("repeatPenalty") && opts.Get("repeatPenalty").IsNumber()) {
-        repeat_penalty = opts.Get("repeatPenalty").As<Napi::Number>().FloatValue();
-    }
-    if (opts.Has("repeatLastN") && opts.Get("repeatLastN").IsNumber()) {
-        repeat_last_n = opts.Get("repeatLastN").As<Napi::Number>().Int32Value();
-    }
+
     if (opts.Has("nCtx") && opts.Get("nCtx").IsNumber()) {
-        n_ctx = opts.Get("nCtx").As<Napi::Number>().Uint32Value();
+        gp.n_ctx = opts.Get("nCtx").As<Napi::Number>().Uint32Value();
     }
-    if (opts.Has("grammar") && opts.Get("grammar").IsString()) {
-        grammar_str = opts.Get("grammar").As<Napi::String>().Utf8Value();
-    }
-    if (opts.Has("stop") && opts.Get("stop").IsArray()) {
-        Napi::Array arr = opts.Get("stop").As<Napi::Array>();
-        for (uint32_t i = 0; i < arr.Length(); ++i) {
-            Napi::Value v = arr.Get(i);
-            if (v.IsString()) {
-                stop_sequences.push_back(v.As<Napi::String>().Utf8Value());
-            }
-        }
-    }
-    if (opts.Has("grammarTriggerPatterns") && opts.Get("grammarTriggerPatterns").IsArray()) {
-        Napi::Array arr = opts.Get("grammarTriggerPatterns").As<Napi::Array>();
-        for (uint32_t i = 0; i < arr.Length(); ++i) {
-            Napi::Value v = arr.Get(i);
-            if (v.IsString()) {
-                grammar_trigger_patterns.push_back(v.As<Napi::String>().Utf8Value());
-            }
-        }
-    }
+    get_str("grammar", gp.grammar);
+    get_str_array("stop",                   gp.stop_sequences);
+    get_str_array("grammarTriggerPatterns", gp.grammar_trigger_patterns);
+    get_str_array("preservedTokens",        gp.preserved_tokens);
     if (opts.Has("grammarTriggerTokens") && opts.Get("grammarTriggerTokens").IsArray()) {
         Napi::Array arr = opts.Get("grammarTriggerTokens").As<Napi::Array>();
         for (uint32_t i = 0; i < arr.Length(); ++i) {
             Napi::Value v = arr.Get(i);
             if (v.IsNumber()) {
-                grammar_trigger_tokens.push_back(v.As<Napi::Number>().Int32Value());
+                gp.grammar_trigger_tokens.push_back(v.As<Napi::Number>().Int32Value());
             }
         }
     }
-    if (opts.Has("preservedTokens") && opts.Get("preservedTokens").IsArray()) {
-        Napi::Array arr = opts.Get("preservedTokens").As<Napi::Array>();
-        for (uint32_t i = 0; i < arr.Length(); ++i) {
-            Napi::Value v = arr.Get(i);
-            if (v.IsString()) {
-                preserved_tokens.push_back(v.As<Napi::String>().Utf8Value());
-            }
-        }
-    }
-    bool reset_context = false;
     if (opts.Has("resetContext") && opts.Get("resetContext").IsBoolean()) {
-        reset_context = opts.Get("resetContext").As<Napi::Boolean>().Value();
+        gp.reset_context = opts.Get("resetContext").As<Napi::Boolean>().Value();
     }
-    bool    want_logprobs   = false;
-    int32_t top_logprobs_n  = 0;
     if (opts.Has("logprobs") && opts.Get("logprobs").IsBoolean()) {
-        want_logprobs = opts.Get("logprobs").As<Napi::Boolean>().Value();
+        gp.want_logprobs = opts.Get("logprobs").As<Napi::Boolean>().Value();
     }
     if (opts.Has("topLogprobs") && opts.Get("topLogprobs").IsNumber()) {
-        top_logprobs_n = opts.Get("topLogprobs").As<Napi::Number>().Int32Value();
-        if (top_logprobs_n > 0) want_logprobs = true;  // imply logprobs
+        gp.top_logprobs_n = opts.Get("topLogprobs").As<Napi::Number>().Int32Value();
+        if (gp.top_logprobs_n > 0) gp.want_logprobs = true;  // imply logprobs
     }
-    int64_t seed_opt = -1;
     if (opts.Has("seed") && opts.Get("seed").IsNumber()) {
-        seed_opt = opts.Get("seed").As<Napi::Number>().Int64Value();
+        gp.seed = opts.Get("seed").As<Napi::Number>().Int64Value();
     }
-    std::vector<std::pair<int32_t, float>> logit_bias;
     if (opts.Has("logitBias") && opts.Get("logitBias").IsObject()) {
         Napi::Object lb = opts.Get("logitBias").As<Napi::Object>();
         Napi::Array  keys = lb.GetPropertyNames();
-        logit_bias.reserve(keys.Length());
+        gp.logit_bias.reserve(keys.Length());
         for (uint32_t i = 0; i < keys.Length(); ++i) {
             Napi::Value k = keys.Get(i);
             // Numeric-string keys (JS object keys are always strings) →
@@ -425,9 +441,18 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
             Napi::Value v = lb.Get(k);
             if (!v.IsNumber()) continue;
             float bias = v.As<Napi::Number>().FloatValue();
-            logit_bias.emplace_back((int32_t) tok_id, bias);
+            gp.logit_bias.emplace_back((int32_t) tok_id, bias);
         }
     }
+
+    // Reasoning budget (tokens inside the thinking block). The tags are
+    // tokenized on the worker thread; chat() forwards the template's
+    // thinkingStartTag / thinkingEndTags automatically.
+    get_i32("reasoningBudget",         gp.reasoning_budget);
+    get_str("reasoningBudgetStartTag", gp.reasoning_budget_start_tag);
+    get_str_array("reasoningBudgetEndTags", gp.reasoning_budget_end_tags);
+    get_str("reasoningBudgetMessage",  gp.reasoning_budget_message);
+    get_str("reasoningBudgetPrefill",  gp.reasoning_budget_prefill);
 
     // Context setup (possibly involving llama_free / llama_init_from_model)
     // is done by the worker under ctx_mutex_ — never on the JS main thread,
@@ -464,16 +489,7 @@ Napi::Value LlamaModel::Generate(const Napi::CallbackInfo & info) {
     auto * worker = new GenerateWorker(
         token_cb, wrapped_done,
         this, state,
-        prompt,
-        n_ctx, reset_context,
-        n_predict, temperature, top_p, top_k,
-        min_p, repeat_penalty, repeat_last_n,
-        std::move(grammar_str), std::move(stop_sequences),
-        std::move(grammar_trigger_patterns),
-        std::move(grammar_trigger_tokens),
-        std::move(preserved_tokens),
-        want_logprobs, top_logprobs_n,
-        seed_opt, std::move(logit_bias)
+        std::move(gp)
     );
 
     worker->Queue();
@@ -819,6 +835,19 @@ Napi::Value LlamaModel::GetModelInfo(const Napi::CallbackInfo & info) {
     tokens.Set("eos", Napi::Number::New(env, llama_vocab_eos(vocab_)));
     tokens.Set("eot", Napi::Number::New(env, llama_vocab_eot(vocab_)));
     obj.Set("specialTokens", tokens);
+
+    // Whisper-style suppress list baked into the vocab metadata (empty for
+    // most text models). Useful for seeding logitBias with -Infinity bans.
+    {
+        int32_t n_suppress = 0;
+        const llama_token * suppress =
+            llama_vocab_get_suppress_tokens(vocab_, &n_suppress);
+        Napi::Array arr = Napi::Array::New(env, (size_t) std::max(n_suppress, 0));
+        for (int32_t i = 0; i < n_suppress; ++i) {
+            arr.Set((uint32_t) i, Napi::Number::New(env, suppress[i]));
+        }
+        obj.Set("suppressTokens", arr);
+    }
 
     return obj;
 }

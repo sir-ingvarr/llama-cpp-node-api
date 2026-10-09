@@ -63,7 +63,30 @@ export interface LlamaModelOptions {
      * require elevated permissions (`ulimit -l` / `CAP_IPC_LOCK`).
      */
     useMlock?: boolean;
+    /**
+     * Model-load strategy, superseding `useMmap`/`useMlock` when present:
+     * `'auto'` (default — llama.cpp picks per device), `'none'`, `'mmap'`,
+     * `'mlock'`, `'mmap+mlock'`, or `'directio'` (direct I/O where the OS
+     * supports it, bypassing the page cache for faster cold loads).
+     */
+    loadMode?: LoadMode;
+    /**
+     * LoRA adapters to load with the model and apply to every context.
+     * Each entry is a `.gguf` adapter path or `{ path, scale }` (scale
+     * defaults to 1.0). Adapters are loaded on the worker thread when using
+     * `LlamaModel.load()` and freed with the model.
+     */
+    loras?: Array<string | LoraSpec>;
 }
+
+export interface LoraSpec {
+    /** Path to the LoRA adapter .gguf file. */
+    path: string;
+    /** Blend strength. Default: 1.0. */
+    scale?: number;
+}
+
+export type LoadMode = 'auto' | 'none' | 'mmap' | 'mlock' | 'mmap+mlock' | 'directio';
 
 export type CacheType =
     | 'f32' | 'f16' | 'bf16'
@@ -96,6 +119,90 @@ export interface GenerateOptions {
      * Default: 64. Set to 0 to disable penalty entirely.
      */
     repeatLastN?: number;
+    /**
+     * Locally typical sampling cutoff (https://arxiv.org/abs/2202.00666).
+     * Default: 1.0 (disabled). Typical value: 0.9–0.95.
+     */
+    typicalP?: number;
+    /**
+     * XTC ("exclude top choices") sampler: with probability `xtcProbability`,
+     * removes all but the least-probable token whose probability exceeds
+     * `xtcThreshold`, boosting creativity by skipping the obvious choice.
+     * Default: 0 (disabled). Typical value: 0.5.
+     */
+    xtcProbability?: number;
+    /** XTC probability threshold. Default: 0.1. Values > 0.5 disable XTC. */
+    xtcThreshold?: number;
+    /**
+     * Top-n-sigma sampling (https://arxiv.org/pdf/2411.07641): keep tokens
+     * within `n` standard deviations of the max logit. Default: -1 (disabled).
+     * Typical value: 1–2.
+     */
+    topNSigma?: number;
+    /**
+     * DRY ("don't repeat yourself") sequence-repetition penalty multiplier.
+     * Default: 0 (disabled). Typical value: 0.8. Penalizes tokens that would
+     * extend a sequence already seen in the recent context.
+     */
+    dryMultiplier?: number;
+    /** DRY exponential base. Default: 1.75. */
+    dryBase?: number;
+    /** Repeats up to this length are not penalized by DRY. Default: 2. */
+    dryAllowedLength?: number;
+    /** How many recent tokens DRY scans for repetitions. Default: 64. 0 disables. */
+    dryPenaltyLastN?: number;
+    /**
+     * Strings that reset DRY sequence matching (so e.g. chat-turn structure
+     * isn't penalized). Default: `['\n', ':', '"', '*']`.
+     */
+    drySequenceBreakers?: string[];
+    /**
+     * Mirostat sampling (https://arxiv.org/abs/2007.14966): 0 = disabled
+     * (default), 1 = Mirostat v1, 2 = Mirostat v2. When enabled, replaces
+     * the top-k/top-p/min-p/typical/XTC filter stack — the chain becomes
+     * logit-bias → grammar → temperature → mirostat.
+     */
+    mirostat?: 0 | 1 | 2;
+    /** Mirostat target entropy (tau). Default: 5.0. */
+    mirostatTau?: number;
+    /** Mirostat learning rate (eta). Default: 0.1. */
+    mirostatEta?: number;
+    /**
+     * Dynamic-temperature (entropy) range (https://arxiv.org/abs/2309.02772).
+     * When > 0, temperature varies in [temperature - range, temperature + range]
+     * scaled by candidate entropy. Default: 0 (plain temperature).
+     */
+    dynatempRange?: number;
+    /** Dynamic-temperature exponent. Default: 1.0. */
+    dynatempExponent?: number;
+    /**
+     * Adaptive-p sampling: steer token selection toward a target probability
+     * over time (EMA-tracked). Replaces the final `dist` sampler; only mild
+     * truncation (e.g. min-p) before it is recommended. Valid range 0–1;
+     * default: -1 (disabled).
+     */
+    adaptivePTarget?: number;
+    /** Adaptive-p EMA decay (history ≈ 1/(1-decay) tokens, 0–0.99). Default: 0.9. */
+    adaptivePDecay?: number;
+    /**
+     * Max number of tokens the model may generate inside a thinking block
+     * before the block is force-closed. Requires `reasoningBudgetStartTag`
+     * and `reasoningBudgetEndTags` (both supplied automatically by `chat()`
+     * from the template's detected tags). Default: -1 (unlimited).
+     */
+    reasoningBudget?: number;
+    /** Thinking-block start tag (e.g. `'<think>'`). */
+    reasoningBudgetStartTag?: string;
+    /** Thinking-block end tags; the first one is forced on budget expiry. */
+    reasoningBudgetEndTags?: string[];
+    /** Text injected before the forced end tag when the budget runs out. */
+    reasoningBudgetMessage?: string;
+    /**
+     * Assistant-turn prefix already present in the prompt (so a template that
+     * pre-opens the thinking block starts the budget counting immediately).
+     * `chat()` passes `ChatTemplateJinjaResult.generationPrompt` here.
+     */
+    reasoningBudgetPrefill?: string;
     /**
      * GBNF grammar string to constrain output structure (e.g. enforce JSON).
      * Takes precedence over `grammarFile` if both are provided.
@@ -277,6 +384,15 @@ export interface ChatOptions extends Omit<GenerateOptions, 'grammar' | 'grammarT
     jsonSchema?: string | object;
     chatTemplateKwargs?: Record<string, string>;
     chatTemplateOverride?: string;
+    /**
+     * Cap the number of tokens generated inside the template's thinking
+     * block; when exhausted the block is force-closed (optionally after
+     * `reasoningBudgetMessage`). Ignored when the template exposes no
+     * thinking tags. Default: unlimited.
+     */
+    reasoningBudget?: number;
+    /** Text injected before the forced thinking end tag on budget expiry. */
+    reasoningBudgetMessage?: string;
 }
 
 export interface ChatResult {
@@ -332,6 +448,10 @@ export interface ChatTemplateJinjaResult {
      * markers). Merge with your own `stop` before calling `generate()`.
      */
     additionalStops?: string[];
+    /** Thinking-block start tag detected by the template parser (e.g. `'<think>'`). */
+    thinkingStartTag?: string;
+    /** Thinking-block end tags detected by the template parser (e.g. `['</think>']`). */
+    thinkingEndTags?: string[];
 }
 
 export interface ChatMessage {
@@ -384,6 +504,11 @@ export interface ModelInfo {
     vocabSize: number;
     /** Special token IDs. */
     specialTokens: SpecialTokens;
+    /**
+     * Whisper-style token-suppression list baked into the vocab metadata
+     * (empty for most text models). Candidates for `logitBias` bans.
+     */
+    suppressTokens: number[];
 }
 
 /**
@@ -486,6 +611,19 @@ export declare class LlamaModel {
      * overridden via `poolingType` at construction.
      */
     embed(text: string): Promise<Float32Array>;
+    /**
+     * Save the current context state (KV cache + RNG) to a file. Requires a
+     * live context (run a generation first). Optionally stores the prompt
+     * tokens that produced the state so `loadState` can return them. State
+     * files are not portable across llama.cpp versions, models, or context
+     * configurations.
+     */
+    saveState(path: string, opts?: { tokens?: number[] }): Promise<void>;
+    /**
+     * Restore a context state written by `saveState` (creating the context
+     * if needed). Resolves with the token list stored in the file.
+     */
+    loadState(path: string): Promise<number[]>;
     /** Cancel every currently running and queued generation on this model. */
     abort(): void;
     dispose(): void;
@@ -597,3 +735,6 @@ export declare function inspect(path: string, opts?: InspectOptions): Promise<Gg
 
 /** Flush the in-process `inspect()` memoization cache. */
 export declare function clearInspectCache(): void;
+
+/** Upstream llama.cpp version string (e.g. "0.6.0"), for diagnostics. */
+export declare function llamaVersion(): string;

@@ -1,0 +1,52 @@
+# Per-push build status (the README "Build" badge). Compiles the addon on
+# one cheap platform and hands the binary to the Tests workflow, which runs
+# on its completion — so the native module is only compiled once per push.
+# The full four-platform matrix still runs in prebuild.yml before a release.
+name: Build
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          submodules: recursive
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+
+      - name: Install dependencies (skip native build)
+        run: npm install --ignore-scripts
+
+      - name: Build native module
+        run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
+
+      - name: Stage binary for the Tests workflow
+        run: |
+          set -euo pipefail
+          NODE_FILE=$(find build -name "llama_node.node" -type f | head -1)
+          if [ -z "$NODE_FILE" ]; then
+            echo "::error::Could not find llama_node.node"
+            exit 1
+          fi
+          mkdir -p artifact
+          cp "$NODE_FILE" artifact/llama_node.node
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: ci-binary
+          path: artifact/llama_node.node
+          if-no-files-found: error
+          retention-days: 1

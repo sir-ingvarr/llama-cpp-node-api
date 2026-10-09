@@ -1,10 +1,15 @@
 # llama-cpp-node-api
 
+[![Build](https://github.com/sir-ingvarr/llama-cpp-node-api/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/sir-ingvarr/llama-cpp-node-api/actions/workflows/build.yml)
+[![Tests](https://github.com/sir-ingvarr/llama-cpp-node-api/actions/workflows/tests.yml/badge.svg)](https://github.com/sir-ingvarr/llama-cpp-node-api/actions/workflows/tests.yml)
+
+[Changelog](CHANGELOG.md) · [Releases](https://github.com/sir-ingvarr/llama-cpp-node-api/releases)
+
 <p align="center">
   <img src="assets/logo.png" alt="llama-cpp-node-api logo" width="200" />
 </p>
 
-> **Warning: this is a vibe-coded library.** It was built with AI assistance, has no test suite, and has seen limited real-world use. The API may change. Use in production at your own risk.
+> **Warning: this is a vibe-coded library.** It was built with AI assistance and has seen limited real-world use. The API may change. Use in production at your own risk.
 
 Node.js native addon that runs [llama.cpp](https://github.com/ggml-org/llama.cpp) inference directly in the Node.js/Electron process — no child processes, no HTTP, no IPC overhead. Model weights stay loaded in memory across calls.
 

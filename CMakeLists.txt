@@ -93,6 +93,7 @@ add_library(llama_node SHARED
     src/inspect_worker.cpp
     src/load_worker.cpp
     src/embed_worker.cpp
+    src/state_worker.cpp
     src/chat_templates.cpp
 )
 

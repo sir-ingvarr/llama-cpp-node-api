@@ -1,7 +1,10 @@
 #include "generate_worker.h"
 #include "addon_state.h"
 
+#include "reasoning-budget.h"  // libcommon: common_reasoning_budget_init
+
 #include <algorithm>
+#include <cctype>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -31,53 +34,34 @@ static size_t complete_utf8_boundary(const std::string & s) {
     return 0;
 }
 
+// Tokenize a tag/message with add_special=false, parse_special=true
+// (equivalent to libcommon's common_tokenize for special sequences).
+static std::vector<llama_token> tokenize_special(
+    const llama_vocab * vocab, const std::string & text)
+{
+    if (text.empty()) return {};
+    int32_t n = -llama_tokenize(vocab, text.c_str(), (int32_t)text.size(),
+                                nullptr, 0, false, true);
+    if (n <= 0) return {};
+    std::vector<llama_token> toks((size_t)n);
+    if (llama_tokenize(vocab, text.c_str(), (int32_t)text.size(),
+                       toks.data(), (int32_t)toks.size(), false, true) < 0) {
+        return {};
+    }
+    return toks;
+}
+
 GenerateWorker::GenerateWorker(
-    Napi::Function &                  token_cb,
-    Napi::Function &                  done_cb,
-    LlamaModel *                      owner,
-    std::shared_ptr<RequestState>     state,
-    const std::string &               prompt,
-    uint32_t                          n_ctx,
-    bool                              reset_context,
-    int32_t                           n_predict,
-    float                             temperature,
-    float                             top_p,
-    int32_t                           top_k,
-    float                             min_p,
-    float                             repeat_penalty,
-    int32_t                           repeat_last_n,
-    std::string                       grammar_str,
-    std::vector<std::string>          stop_sequences,
-    std::vector<std::string>          grammar_trigger_patterns,
-    std::vector<int32_t>              grammar_trigger_tokens,
-    std::vector<std::string>          preserved_tokens,
-    bool                              want_logprobs,
-    int32_t                           top_logprobs_n,
-    int64_t                                          seed,
-    std::vector<std::pair<int32_t, float>>           logit_bias
+    Napi::Function &              token_cb,
+    Napi::Function &              done_cb,
+    LlamaModel *                  owner,
+    std::shared_ptr<RequestState> state,
+    GenerateParams                params
 )
     : Napi::AsyncProgressQueueWorker<TokenChunk>(token_cb.Env()),
       owner_(owner),
       state_(std::move(state)),
-      prompt_(prompt),
-      n_ctx_(n_ctx),
-      reset_context_(reset_context),
-      n_predict_(n_predict),
-      temperature_(temperature),
-      top_p_(top_p),
-      top_k_(top_k),
-      min_p_(min_p),
-      repeat_penalty_(repeat_penalty),
-      repeat_last_n_(repeat_last_n),
-      grammar_str_(std::move(grammar_str)),
-      stop_sequences_(std::move(stop_sequences)),
-      grammar_trigger_patterns_(std::move(grammar_trigger_patterns)),
-      grammar_trigger_tokens_(std::move(grammar_trigger_tokens)),
-      preserved_tokens_(std::move(preserved_tokens)),
-      want_logprobs_(want_logprobs),
-      top_logprobs_n_(top_logprobs_n),
-      seed_(seed),
-      logit_bias_(std::move(logit_bias))
+      p_(std::move(params))
 {
     token_cb_ = Napi::Persistent(token_cb);
     done_cb_  = Napi::Persistent(done_cb);
@@ -133,7 +117,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // Prepare the context now (on the worker thread) so the JS main thread
     // never blocks on ctx_mutex_. See LlamaModel::PrepareContextLocked.
     std::string ctx_err;
-    if (!owner_->PrepareContextLocked(n_ctx_, reset_context_, ctx_err)) {
+    if (!owner_->PrepareContextLocked(p_.n_ctx, p_.reset_context, ctx_err)) {
         SetError(ctx_err);
         return;
     }
@@ -149,7 +133,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
 
     // Tokenize
     const int n_prompt_tokens_neg =
-        -llama_tokenize(vocab, prompt_.c_str(), (int32_t)prompt_.size(),
+        -llama_tokenize(vocab, p_.prompt.c_str(), (int32_t)p_.prompt.size(),
                         nullptr, 0, is_first, true);
     if (n_prompt_tokens_neg <= 0) {
         owner_->clear_active_request();
@@ -158,7 +142,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     }
 
     std::vector<llama_token> prompt_tokens((size_t)n_prompt_tokens_neg);
-    if (llama_tokenize(vocab, prompt_.c_str(), (int32_t)prompt_.size(),
+    if (llama_tokenize(vocab, p_.prompt.c_str(), (int32_t)p_.prompt.size(),
                        prompt_tokens.data(), (int32_t)prompt_tokens.size(),
                        is_first, true) < 0) {
         owner_->clear_active_request();
@@ -177,9 +161,10 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     }
 
     // Build sampler chain.
-    // Grammar must come FIRST so it zeros out non-grammatical tokens from the
-    // full logit distribution before top-k/top-p/min-p can discard them.
-    // Order mirrors llama.cpp's common_sampler "grammar_first" path.
+    // Grammar must come before the probability filters so it zeros out
+    // non-grammatical tokens from the full logit distribution before
+    // top-k/top-p/min-p can discard them. Order mirrors llama.cpp's
+    // common_sampler "grammar_first" path.
     using SamplerPtr = std::unique_ptr<llama_sampler, decltype(&llama_sampler_free)>;
     SamplerPtr smpl_owner{
         llama_sampler_chain_init(llama_sampler_chain_default_params()),
@@ -187,13 +172,66 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     };
     llama_sampler * smpl = smpl_owner.get();
 
-    // 0. Logit bias — additive on raw logits, applied before grammar so that
+    const uint32_t seed = (p_.seed < 0) ? LLAMA_DEFAULT_SEED : (uint32_t) p_.seed;
+
+    // 0. Reasoning budget — first in the chain so it can force the end tag by
+    //    masking everything else before any other sampler runs. The budget
+    //    sampler is a passthrough outside the thinking block. Combining it
+    //    with an *eager* grammar is unsupported (the grammar could mask the
+    //    forced end-tag tokens); lazy tool-call grammars trigger after the
+    //    thinking block closes and are fine.
+    if (p_.reasoning_budget >= 0 &&
+        !p_.reasoning_budget_start_tag.empty() &&
+        !p_.reasoning_budget_end_tags.empty()) {
+        const llama_tokens start = tokenize_special(vocab, p_.reasoning_budget_start_tag);
+        std::vector<llama_tokens> ends;
+        ends.reserve(p_.reasoning_budget_end_tags.size());
+        for (const auto & tag : p_.reasoning_budget_end_tags) {
+            llama_tokens e = tokenize_special(vocab, tag);
+            if (!e.empty()) ends.push_back(std::move(e));
+        }
+        if (!start.empty() && !ends.empty()) {
+            llama_tokens forced = ends.front();
+            if (!p_.reasoning_budget_message.empty()) {
+                const llama_tokens msg =
+                    tokenize_special(vocab, p_.reasoning_budget_message);
+                forced.insert(forced.begin(), msg.begin(), msg.end());
+            }
+            llama_sampler * rbudget = common_reasoning_budget_init(
+                vocab, {start}, ends, forced, p_.reasoning_budget);
+
+            // Feed the assistant-turn prefix already present in the prompt
+            // (e.g. a template that pre-opens "<think>") so the state machine
+            // starts counting if the block is already open. Mirrors
+            // common_sampler_init's prefill handling, including the skip of a
+            // tokenizer-injected leading space.
+            if (!p_.reasoning_budget_prefill.empty()) {
+                const llama_tokens prefill =
+                    tokenize_special(vocab, p_.reasoning_budget_prefill);
+                for (size_t i = 0; i < prefill.size(); ++i) {
+                    if (i == 0) {
+                        char pbuf[64];
+                        int pn = llama_token_to_piece(vocab, prefill[0],
+                                                      pbuf, sizeof(pbuf), 0, true);
+                        if (pn > 0 && std::isspace((unsigned char)pbuf[0]) &&
+                            !std::isspace((unsigned char)p_.reasoning_budget_prefill[0])) {
+                            continue;
+                        }
+                    }
+                    llama_sampler_accept(rbudget, prefill[i]);
+                }
+            }
+            llama_sampler_chain_add(smpl, rbudget);
+        }
+    }
+
+    // 1. Logit bias — additive on raw logits, applied before grammar so that
     //    a positive bias on a grammar-disallowed token cannot resurrect it
     //    (grammar masks to -inf afterward and has the final say).
-    if (!logit_bias_.empty()) {
+    if (!p_.logit_bias.empty()) {
         std::vector<llama_logit_bias> biases;
-        biases.reserve(logit_bias_.size());
-        for (const auto & [tok, b] : logit_bias_) {
+        biases.reserve(p_.logit_bias.size());
+        for (const auto & [tok, b] : p_.logit_bias) {
             biases.push_back({ (llama_token) tok, b });
         }
         llama_sampler_chain_add(smpl,
@@ -203,61 +241,113 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
                 biases.data()));
     }
 
-    // 1. Grammar — constrain logits before any probability filtering.
+    // 2. Grammar — constrain logits before any probability filtering.
     //    Triggers switch the sampler to "lazy" mode: grammar stays off until
     //    one of the patterns/tokens appears in the output, then activates for
     //    the remainder. Used e.g. for tool calls where the model writes prose
     //    first and only constrains once it emits <tool_call>.
-    if (!grammar_str_.empty()) {
+    if (!p_.grammar.empty()) {
         const bool lazy =
-            !grammar_trigger_patterns_.empty() || !grammar_trigger_tokens_.empty();
+            !p_.grammar_trigger_patterns.empty() || !p_.grammar_trigger_tokens.empty();
         if (lazy) {
             std::vector<const char *> pat_ptrs;
-            pat_ptrs.reserve(grammar_trigger_patterns_.size());
-            for (const auto & p : grammar_trigger_patterns_) {
+            pat_ptrs.reserve(p_.grammar_trigger_patterns.size());
+            for (const auto & p : p_.grammar_trigger_patterns) {
                 pat_ptrs.push_back(p.c_str());
             }
             std::vector<llama_token> tok_ids;
-            tok_ids.reserve(grammar_trigger_tokens_.size());
-            for (auto t : grammar_trigger_tokens_) {
+            tok_ids.reserve(p_.grammar_trigger_tokens.size());
+            for (auto t : p_.grammar_trigger_tokens) {
                 tok_ids.push_back((llama_token)t);
             }
             llama_sampler_chain_add(smpl,
                 llama_sampler_init_grammar_lazy_patterns(
-                    vocab, grammar_str_.c_str(), "root",
+                    vocab, p_.grammar.c_str(), "root",
                     pat_ptrs.data(), pat_ptrs.size(),
                     tok_ids.data(),  tok_ids.size()));
         } else {
             llama_sampler_chain_add(smpl,
-                llama_sampler_init_grammar(vocab, grammar_str_.c_str(), "root"));
+                llama_sampler_init_grammar(vocab, p_.grammar.c_str(), "root"));
         }
     }
-    // 2. Repeat penalty
-    if (repeat_penalty_ != 1.0f && repeat_last_n_ != 0) {
-        llama_sampler_chain_add(smpl,
-            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),
-                                         repeat_last_n_, repeat_penalty_,
-                                         0.0f, 0.0f));
-    }
-    // 3. Top-k
-    if (top_k_ > 0) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_k(top_k_));
-    }
-    // 4. Top-p
-    if (top_p_ < 1.0f) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_top_p(top_p_, 1));
-    }
-    // 5. Min-p
-    if (min_p_ > 0.0f) {
-        llama_sampler_chain_add(smpl, llama_sampler_init_min_p(min_p_, 1));
-    }
-    // 6. Temperature
-    llama_sampler_chain_add(smpl, llama_sampler_init_temp(temperature_));
-    // 7. Final stochastic sampler — `seed_ < 0` means "use the default
-    //    non-deterministic seed"; any non-negative value pins the RNG.
-    {
-        const uint32_t s = (seed_ < 0) ? LLAMA_DEFAULT_SEED : (uint32_t) seed_;
-        llama_sampler_chain_add(smpl, llama_sampler_init_dist(s));
+
+    if (p_.mirostat == 0) {
+        // 3. Repeat penalty
+        if (p_.repeat_penalty != 1.0f && p_.repeat_last_n != 0) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),
+                                             p_.repeat_last_n, p_.repeat_penalty,
+                                             0.0f, 0.0f));
+        }
+        // 4. DRY (don't-repeat-yourself) repetition penalty
+        if (p_.dry_multiplier > 0.0f) {
+            std::vector<const char *> breakers;
+            breakers.reserve(p_.dry_sequence_breakers.size());
+            for (const auto & b : p_.dry_sequence_breakers) {
+                breakers.push_back(b.c_str());
+            }
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_dry(vocab,
+                                       p_.dry_multiplier, p_.dry_base,
+                                       p_.dry_allowed_length, p_.dry_penalty_last_n,
+                                       breakers.data(), breakers.size()));
+        }
+        // 5. Top-n-sigma
+        if (p_.top_n_sigma >= 0.0f) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_top_n_sigma(p_.top_n_sigma));
+        }
+        // 6. Top-k
+        if (p_.top_k > 0) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_k(p_.top_k));
+        }
+        // 7. Typical-p (locally typical sampling)
+        if (p_.typical_p < 1.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_typical(p_.typical_p, 1));
+        }
+        // 8. Top-p
+        if (p_.top_p < 1.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_top_p(p_.top_p, 1));
+        }
+        // 9. Min-p
+        if (p_.min_p > 0.0f) {
+            llama_sampler_chain_add(smpl, llama_sampler_init_min_p(p_.min_p, 1));
+        }
+        // 10. XTC (exclude top choices)
+        if (p_.xtc_probability > 0.0f) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_xtc(p_.xtc_probability, p_.xtc_threshold, 1, seed));
+        }
+        // 11. Temperature — temp_ext (dynamic temperature / entropy scaling)
+        //     when a dynatemp range is set, plain temp otherwise.
+        if (p_.dynatemp_range > 0.0f) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_temp_ext(p_.temperature, p_.dynatemp_range,
+                                            p_.dynatemp_exponent));
+        } else {
+            llama_sampler_chain_add(smpl, llama_sampler_init_temp(p_.temperature));
+        }
+        // 12. Final token selector — adaptive-p when a target is configured,
+        //     plain dist otherwise.
+        if (p_.adaptive_p_target >= 0.0f) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_adaptive_p(p_.adaptive_p_target,
+                                              p_.adaptive_p_decay, seed));
+        } else {
+            llama_sampler_chain_add(smpl, llama_sampler_init_dist(seed));
+        }
+    } else {
+        // Mirostat replaces the filter stack (mirrors upstream behaviour):
+        // temp → mirostat, which selects the token itself.
+        llama_sampler_chain_add(smpl, llama_sampler_init_temp(p_.temperature));
+        if (p_.mirostat == 1) {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_mirostat(llama_vocab_n_tokens(vocab), seed,
+                                            p_.mirostat_tau, p_.mirostat_eta, 100));
+        } else {
+            llama_sampler_chain_add(smpl,
+                llama_sampler_init_mirostat_v2(seed, p_.mirostat_tau, p_.mirostat_eta));
+        }
     }
 
     llama_batch batch =
@@ -293,7 +383,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         if (!full.empty()) {
             TokenChunk ch;
             ch.text = std::move(full);
-            if (want_logprobs_) {
+            if (p_.want_logprobs) {
                 ch.has_logprobs = true;
                 ch.logprob      = cur_logprob;
                 ch.top_logprobs = cur_top;
@@ -331,7 +421,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         // Compute logprobs for this token from the raw model logits BEFORE
         // any sampler-stage filtering (so the user sees the model's
         // distribution, not the post-grammar/penalty distribution).
-        if (want_logprobs_) {
+        if (p_.want_logprobs) {
             const float * logits  = llama_get_logits_ith(ctx, -1);
             const int     n_vocab = llama_vocab_n_tokens(vocab);
             float max_logit = -std::numeric_limits<float>::infinity();
@@ -346,12 +436,12 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
             cur_logprob = logits[new_token_id] - lse;
 
             cur_top.clear();
-            if (top_logprobs_n_ > 0) {
+            if (p_.top_logprobs_n > 0) {
                 auto & idx = logprob_scratch;
                 idx.clear();                       // retains capacity
                 idx.reserve((size_t) n_vocab);     // no-op after the first token
                 for (int i = 0; i < n_vocab; ++i) idx.emplace_back(logits[i], i);
-                const int K = std::min(top_logprobs_n_, n_vocab);
+                const int K = std::min(p_.top_logprobs_n, n_vocab);
                 std::partial_sort(idx.begin(), idx.begin() + K, idx.end(),
                     [](const std::pair<float,int> & a,
                        const std::pair<float,int> & b) { return a.first > b.first; });
@@ -378,27 +468,29 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         pending.append(buf, (size_t)n);
 
         // --- Stop sequence detection ---
-        if (!stop_sequences_.empty()) {
-            bool stopped = false;
-            for (const auto & stop : stop_sequences_) {
+        if (!p_.stop_sequences.empty()) {
+            // Search the whole pending buffer, not just its tail: a single
+            // sampled token can contain a stop sequence mid-piece (e.g. a
+            // "\n\n" token when stopping on "\n"), or even trailing text
+            // after it. Take the earliest match across all stop sequences.
+            size_t stop_pos = std::string::npos;
+            for (const auto & stop : p_.stop_sequences) {
                 if (stop.empty()) continue;
-                if (pending.size() >= stop.size()) {
-                    size_t off = pending.size() - stop.size();
-                    if (pending.compare(off, stop.size(), stop) == 0) {
-                        // Flush everything before the stop sequence, then halt.
-                        if (off > 0) {
-                            emit(pending.substr(0, off));
-                        }
-                        pending.clear();
-                        stopped = true;
-                        break;
-                    }
-                }
+                size_t pos = pending.find(stop);
+                if (pos < stop_pos) stop_pos = pos;
             }
-            if (stopped) break;
+            if (stop_pos != std::string::npos) {
+                // Flush everything before the stop sequence, drop the stop
+                // itself and anything after it, then halt.
+                if (stop_pos > 0) {
+                    emit(pending.substr(0, stop_pos));
+                }
+                pending.clear();
+                break;
+            }
 
             // Flush only the portion that cannot be the start of a stop sequence.
-            size_t hold = trailing_stop_prefix(pending, stop_sequences_);
+            size_t hold = trailing_stop_prefix(pending, p_.stop_sequences);
             size_t safe  = pending.size() - hold;
             if (safe > 0) {
                 emit(pending.substr(0, safe));
@@ -413,7 +505,7 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
         batch = llama_batch_get_one(&new_token_id, 1);
         ++n_decoded;
 
-        if (n_predict_ > 0 && n_decoded >= n_predict_) {
+        if (p_.n_predict > 0 && n_decoded >= p_.n_predict) {
             break;
         }
     }
