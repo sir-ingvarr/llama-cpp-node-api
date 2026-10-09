@@ -6,6 +6,10 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 `llama-node` is a Node.js native addon (N-API) that wraps [llama.cpp](https://github.com/ggml-org/llama.cpp) for direct in-process LLM inference. It is built with `cmake-js` and targets Electron 35.
 
+## Changelog
+
+`CHANGELOG.md` (Keep a Changelog format) must be updated alongside any user-visible change — new options, behaviour changes, deprecations, upstream submodule bumps, fixes. Add entries under `## [Unreleased]`; on release, rename that section to the new version + date and start a fresh `[Unreleased]`. The sibling repo `node-stable-diffusion-cpp` follows the same convention.
+
 ## Build Commands
 
 The compiled addon is placed at `build/Release/llama_node.node`.
@@ -79,11 +83,11 @@ src/chat_templates.cpp        ← libcommon Jinja renderer + chat-response parse
 vendor/llama.cpp/             ← git submodule (pinned commit)
 ```
 
-Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD_COMMON` is forced `ON` so libcommon (minja Jinja, nlohmann/json, PEG parser, chat format registry) is available.
+Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD_COMMON` is forced `ON` so libcommon (Jinja engine, `common_json`, PEG parser, chat format registry) is available. Since llama.cpp v0.6.0 libcommon no longer exposes nlohmann directly — `chat_templates.cpp` uses the `common_json` pimpl wrapper (`common/json.h`: `parse`, `at`, `get<T>`, no iterators).
 
 ### Key design points
 
-- **`LlamaModel` (C++)** — `Napi::ObjectWrap` owning `llama_model*`, `llama_context*`, `llama_vocab*`. Context is created lazily on the worker thread (not the JS thread — see below) and reused unless `nCtx` changes or `resetContext: true`. Model loading dots are suppressed via a no-op `progress_callback`. KV cache quantization (`cacheTypeK` / `cacheTypeV`) is captured at construction and applied in `EnsureContext`; sentinel `-1` leaves llama.cpp's default (F16). The JS surface accepts string names from the same allowlist as `llama-cli` (`f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`); `normalizeModelOpts()` maps them to ggml_type ints before reaching native. Same instance-field+sentinel pattern carries `flashAttention` (string `'auto'|'on'|'off'` → `llama_flash_attn_type` int, sentinel `-1` = AUTO; **always** assigned because AUTO is itself a valid enum value), `nThreads`, and `nThreadsBatch` (sentinel `-1` skips the override). `useMmap` / `useMlock` are model-load flags applied directly to `llama_model_params` before `llama_model_load_from_file` in both the sync ctor and `LoadWorker::Execute`.
+- **`LlamaModel` (C++)** — `Napi::ObjectWrap` owning `llama_model*`, `llama_context*`, `llama_vocab*`. Context is created lazily on the worker thread (not the JS thread — see below) and reused unless `nCtx` changes or `resetContext: true`. Model loading dots are suppressed via a no-op `progress_callback`. KV cache quantization (`cacheTypeK` / `cacheTypeV`) is captured at construction and applied in `EnsureContext`; sentinel `-1` leaves llama.cpp's default (F16). The JS surface accepts string names from the same allowlist as `llama-cli` (`f32, f16, bf16, q8_0, q4_0, q4_1, iq4_nl, q5_0, q5_1`); `normalizeModelOpts()` maps them to ggml_type ints before reaching native. Same instance-field+sentinel pattern carries `flashAttention` (string `'auto'|'on'|'off'` → `llama_flash_attn_type` int, sentinel `-1` = AUTO; **always** assigned because AUTO is itself a valid enum value), `nThreads`, and `nThreadsBatch` (sentinel `-1` skips the override). `useMmap` / `useMlock` keep their boolean JS surface but are mapped onto the `llama_load_mode` enum (which replaced the `use_mmap`/`use_mlock` bools in `llama_model_params` as of llama.cpp v0.6.0) via `ResolveLoadMode()` in `load_worker.h`; neither option supplied → `LLAMA_LOAD_MODE_AUTO`. Applied before `llama_model_load_from_file` in both the sync ctor and `LoadWorker::Execute`.
 
 - **Concurrent generate()** — `LlamaModel` maintains a request map (`id → shared_ptr<RequestState>`) under `req_mutex_`. Each `generate()` call allocates a `RequestState{ id, cancel }`, registers it, and enqueues a worker. Multiple workers serialize on `ctx_mutex_` in FIFO order. On completion, `wrapped_done` removes the state from the map.
 

@@ -127,12 +127,18 @@ LlamaModel::LlamaModel(const Napi::CallbackInfo & info)
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = n_gpu_layers;
     model_params.progress_callback = [](float, void *) { return true; };
+    bool has_load_opt = false;
+    bool use_mmap     = true;
+    bool use_mlock    = false;
     if (opts.Has("useMmap") && opts.Get("useMmap").IsBoolean()) {
-        model_params.use_mmap = opts.Get("useMmap").As<Napi::Boolean>().Value();
+        use_mmap     = opts.Get("useMmap").As<Napi::Boolean>().Value();
+        has_load_opt = true;
     }
     if (opts.Has("useMlock") && opts.Get("useMlock").IsBoolean()) {
-        model_params.use_mlock = opts.Get("useMlock").As<Napi::Boolean>().Value();
+        use_mlock    = opts.Get("useMlock").As<Napi::Boolean>().Value();
+        has_load_opt = true;
     }
+    model_params.load_mode = ResolveLoadMode(has_load_opt, use_mmap, use_mlock);
 
     model_ = llama_model_load_from_file(model_path.c_str(), model_params);
     if (!model_) {

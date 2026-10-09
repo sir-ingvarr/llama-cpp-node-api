@@ -23,14 +23,13 @@
 #include "common.h"
 #include "peg-parser.h"
 
-#include <nlohmann/json.hpp>
+#include "json.h"  // libcommon's common_json (nlohmann is no longer exposed)
 
 #include <exception>
 #include <map>
 #include <string>
 #include <vector>
 
-using json = nlohmann::ordered_json;
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -90,10 +89,10 @@ static bool looks_like_jinja(const std::string & tmpl) {
 // Render via llama_chat_apply_template() (the legacy C API that resolves
 // named aliases). Used as a fallback when the embedded template is not Jinja.
 static std::string render_legacy(
-    llama_model * model,
-    const json &  messages_json,
-    bool          add_generation_prompt,
-    std::string & error_out)
+    llama_model *       model,
+    const common_json & messages_json,
+    bool                add_generation_prompt,
+    std::string &       error_out)
 {
     const char * tmpl = llama_model_chat_template(model, nullptr);
 
@@ -104,17 +103,19 @@ static std::string render_legacy(
     contents.reserve(messages_json.size());
     chat.reserve(messages_json.size());
 
-    for (const auto & m : messages_json) {
+    // common_json has no iterators; index through the array.
+    for (size_t i = 0; i < messages_json.size(); ++i) {
+        const common_json & m = messages_json.at(i);
         if (!m.contains("role") || !m.contains("content")) {
             error_out = "legacy fallback: each message must have role + content (string)";
             return {};
         }
-        const auto & c = m["content"];
+        const common_json & c = m.at("content");
         if (!c.is_string()) {
             error_out = "legacy fallback: content must be a plain string (legacy path has no tool/multipart support)";
             return {};
         }
-        roles.push_back(m["role"].get<std::string>());
+        roles.push_back(m.at("role").get<std::string>());
         contents.push_back(c.get<std::string>());
     }
     for (size_t i = 0; i < roles.size(); ++i) {
@@ -133,13 +134,15 @@ static std::string render_legacy(
     return std::string(buf.data(), (size_t)len);
 }
 
-// Map "peg-native" / "peg-simple" / "peg-gemma4" / "Content-only" back to
-// the enum. Only four values exist — simple switch.
+// Map a format name ("Content-only", "peg-native", …) back to the enum by
+// walking the enum and comparing against common_chat_format_name(), so new
+// upstream formats are picked up automatically.
 static common_chat_format parse_format_name(const std::string & name) {
-    if (name == "Content-only") return COMMON_CHAT_FORMAT_CONTENT_ONLY;
-    if (name == "peg-simple")   return COMMON_CHAT_FORMAT_PEG_SIMPLE;
-    if (name == "peg-native")   return COMMON_CHAT_FORMAT_PEG_NATIVE;
-    if (name == "peg-gemma4")   return COMMON_CHAT_FORMAT_PEG_GEMMA4;
+    for (int f = 0; f < COMMON_CHAT_FORMAT_COUNT; ++f) {
+        if (name == common_chat_format_name((common_chat_format) f)) {
+            return (common_chat_format) f;
+        }
+    }
     throw std::runtime_error("Unknown chat format name: " + name);
 }
 
@@ -216,9 +219,9 @@ Napi::Value LlamaModel::ApplyChatTemplateJinja(const Napi::CallbackInfo & info) 
                 add_gen_prompt = opts.Get("addGenerationPrompt").As<Napi::Boolean>().Value();
             }
 
-            json messages_json;
+            common_json messages_json;
             try {
-                messages_json = json::parse(messages_str);
+                messages_json = common_json::parse(messages_str);
             } catch (const std::exception & e) {
                 Napi::Error::New(env, std::string("messages JSON parse failed: ") + e.what())
                     .ThrowAsJavaScriptException();
@@ -253,11 +256,11 @@ Napi::Value LlamaModel::ApplyChatTemplateJinja(const Napi::CallbackInfo & info) 
     common_chat_templates_inputs inputs;
 
     try {
-        const json messages_json = json::parse(messages_str);
+        const common_json messages_json = common_json::parse(messages_str);
         inputs.messages = common_chat_msgs_parse_oaicompat(messages_json);
 
         if (has_tools) {
-            const json tools_json = json::parse(tools_str);
+            const common_json tools_json = common_json::parse(tools_str);
             inputs.tools = common_chat_tools_parse_oaicompat(tools_json);
         }
     } catch (const std::exception & e) {

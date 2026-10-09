@@ -88,6 +88,7 @@ static const std::unordered_map<std::string, llama_ftype> & ftype_map() {
         {"MXFP4_MOE", LLAMA_FTYPE_MOSTLY_MXFP4_MOE},
         {"NVFP4",     LLAMA_FTYPE_MOSTLY_NVFP4},
         {"Q1_0",      LLAMA_FTYPE_MOSTLY_Q1_0},
+        {"Q2_0",      LLAMA_FTYPE_MOSTLY_Q2_0},
     };
     return m;
 }

@@ -403,7 +403,7 @@ export type QuantizeFtype =
     | 'IQ1_S' | 'IQ1_M'
     | 'IQ4_NL' | 'IQ4_XS'
     | 'TQ1_0' | 'TQ2_0'
-    | 'MXFP4_MOE' | 'NVFP4' | 'Q1_0';
+    | 'MXFP4_MOE' | 'NVFP4' | 'Q1_0' | 'Q2_0';
 
 export interface QuantizeOptions {
     /** Target quantization ftype. Required. Accepts a string name or the raw enum value. */

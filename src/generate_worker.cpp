@@ -235,7 +235,8 @@ void GenerateWorker::Execute(const ExecutionProgress & progress) {
     // 2. Repeat penalty
     if (repeat_penalty_ != 1.0f && repeat_last_n_ != 0) {
         llama_sampler_chain_add(smpl,
-            llama_sampler_init_penalties(repeat_last_n_, repeat_penalty_,
+            llama_sampler_init_penalties(llama_vocab_n_tokens(vocab),
+                                         repeat_last_n_, repeat_penalty_,
                                          0.0f, 0.0f));
     }
     // 3. Top-k

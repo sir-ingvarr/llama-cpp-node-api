@@ -42,7 +42,8 @@
     "files": [
         "js/",
         "LICENSE",
-        "README.md"
+        "README.md",
+        "CHANGELOG.md"
     ],
     "dependencies": {},
     "devDependencies": {

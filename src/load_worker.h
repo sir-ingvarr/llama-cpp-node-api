@@ -8,6 +8,20 @@
 
 struct AddonState;
 
+// Maps the JS-facing useMmap/useMlock booleans onto llama_load_mode (which
+// replaced the use_mmap/use_mlock bools in llama_model_params as of llama.cpp
+// v0.6.0). When neither option is supplied, AUTO lets llama.cpp pick based on
+// device capabilities. When either is supplied, the unspecified one keeps its
+// historical default (mmap=true, mlock=false) so existing callers see the same
+// behaviour as before the migration.
+inline llama_load_mode ResolveLoadMode(bool has_opt, bool use_mmap, bool use_mlock) {
+    if (!has_opt)               return LLAMA_LOAD_MODE_AUTO;
+    if (use_mmap && use_mlock)  return LLAMA_LOAD_MODE_MMAP_MLOCK;
+    if (use_mmap)               return LLAMA_LOAD_MODE_MMAP;
+    if (use_mlock)              return LLAMA_LOAD_MODE_MLOCK;
+    return LLAMA_LOAD_MODE_NONE;
+}
+
 // Owns a loaded llama_model* between the worker thread that produces it and
 // the JS-thread constructor that consumes it. Wrapped in Napi::External so
 // the GC can free the model if the JS side never picks it up.
@@ -26,10 +40,9 @@ struct LoadHandle {
     // -1 = leave llama_context_default_params() default.
     int32_t       n_threads       = -1;
     int32_t       n_threads_batch = -1;
-    // Model-load flags (applied before llama_model_load_from_file). True/false
-    // override defaults; the worker uses these directly.
-    bool          use_mmap   = true;
-    bool          use_mlock  = false;
+    // Model-load mode (applied before llama_model_load_from_file), already
+    // resolved from the useMmap/useMlock JS options via ResolveLoadMode.
+    llama_load_mode load_mode = LLAMA_LOAD_MODE_AUTO;
     // Per-env state, used only by the External finalizer to detect env teardown
     // (so it can skip llama_model_free and avoid racing llama_backend_free).
     // Non-owning; AddonState outlives the handle.
