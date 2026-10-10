@@ -133,7 +133,10 @@ jobs:
           find "$OUT_DIR" -maxdepth 1 -type f \
             \( -name '*.so' -o -name '*.dll' -o -name '*.dylib' \) \
             -exec cp {} artifact/ \;
-          if [ -n "${LLAMA_NODE_BACKEND_DL:-}" ] && ! ls artifact/libggml-* artifact/ggml-*.dll >/dev/null 2>&1; then
+          # Two separate ls calls: `ls a b` fails when EITHER operand is
+          # missing, and exactly one of the two patterns can ever match
+          # (libggml-*.so on Linux, ggml-*.dll on Windows).
+          if [ -n "${LLAMA_NODE_BACKEND_DL:-}" ] && ! ls artifact/libggml-* >/dev/null 2>&1 && ! ls artifact/ggml-*.dll >/dev/null 2>&1; then
             echo "::error::backend-DL build produced no backend libraries"
             exit 1
           fi
