@@ -2,7 +2,7 @@
 # Build workflow finishing; reuses its compiled binary instead of building
 # again. Unit tests need no model file. The functional suite runs locally
 # via the pre-commit hook (see test/run.js), and unit tests additionally
-# run on all four platforms in prebuild.yml before a release.
+# run on all five platforms in prebuild.yml before a release.
 name: Tests
 
 on:
@@ -42,7 +42,9 @@ jobs:
       - name: Remove prebuilt binaries so tests load the CI-built binary
         run: rm -rf node_modules/@llama-cpp-node-api
 
-      - name: Download the binary built by the Build workflow
+      # Backend-DL build: the artifact holds the addon plus its shared libs
+      # and loadable backends; they all need to sit in one directory.
+      - name: Download the binaries built by the Build workflow
         uses: actions/download-artifact@v8
         with:
           name: ci-binary

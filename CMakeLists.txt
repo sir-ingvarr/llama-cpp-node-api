@@ -57,6 +57,32 @@ if(NOT LLAMA_ROOT AND DEFINED ENV{LLAMA_ROOT})
 endif()
 option(LLAMA_NODE_VENDOR "Use vendor/llama.cpp submodule" OFF)
 
+# Backend-DL mode (vendor mode only): build ggml backends (CPU variants,
+# Vulkan, …) as runtime-loadable libraries placed next to the addon instead
+# of linking one CPU backend statically. The addon then picks the best CPU
+# variant at runtime and skips GPU backends whose system libraries are
+# missing (e.g. no Vulkan loader) instead of failing to load entirely.
+# This is how the published linux/win prebuilds are built. Accepted as a
+# cmake option or, like LLAMA_ROOT, as an environment variable (cmake-js
+# does not reliably forward -D vars to cmake configure).
+option(LLAMA_NODE_BACKEND_DL "Build ggml backends as runtime-loadable libraries" OFF)
+if(NOT LLAMA_NODE_BACKEND_DL AND DEFINED ENV{LLAMA_NODE_BACKEND_DL}
+   AND NOT "$ENV{LLAMA_NODE_BACKEND_DL}" STREQUAL ""
+   AND NOT "$ENV{LLAMA_NODE_BACKEND_DL}" STREQUAL "0")
+    set(LLAMA_NODE_BACKEND_DL ON)
+endif()
+
+# Enable the ggml Vulkan backend (vendor mode only). Requires the Vulkan SDK
+# (glslc + headers) at build time; at runtime only the system Vulkan loader
+# is needed. Combine with LLAMA_NODE_BACKEND_DL so machines without the
+# loader fall back to CPU instead of failing to load the addon.
+option(LLAMA_NODE_VULKAN "Enable the ggml Vulkan backend" OFF)
+if(NOT LLAMA_NODE_VULKAN AND DEFINED ENV{LLAMA_NODE_VULKAN}
+   AND NOT "$ENV{LLAMA_NODE_VULKAN}" STREQUAL ""
+   AND NOT "$ENV{LLAMA_NODE_VULKAN}" STREQUAL "0")
+    set(LLAMA_NODE_VULKAN ON)
+endif()
+
 # Auto-enable vendor mode when the submodule is present and no other source
 # is specified. This means `npm run build` works out of the box after
 # `git submodule update --init --recursive` with no extra flags.
@@ -73,7 +99,33 @@ if(LLAMA_NODE_VENDOR)
     set(LLAMA_BUILD_EXAMPLES OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_SERVER   OFF CACHE BOOL "" FORCE)
     set(LLAMA_BUILD_COMMON   ON  CACHE BOOL "" FORCE)
-    set(BUILD_SHARED_LIBS    OFF CACHE BOOL "" FORCE)
+    if(LLAMA_NODE_BACKEND_DL)
+        # GGML_BACKEND_DL requires shared libs: llama/ggml/ggml-base become
+        # .so/.dll files shipped next to the addon, and each backend becomes
+        # a MODULE library that ggml dlopens at runtime.
+        set(BUILD_SHARED_LIBS ON  CACHE BOOL "" FORCE)
+        set(GGML_BACKEND_DL   ON  CACHE BOOL "" FORCE)
+        # One module per CPU microarchitecture (SSE4.2 … AVX512/AMX on x86,
+        # armv8.x/armv9.x on ARM); ggml scores them at runtime and loads the
+        # best one. Unsupported on Apple platforms (mac prebuilds stay
+        # static anyway — Metal covers acceleration there).
+        if(NOT APPLE)
+            set(GGML_CPU_ALL_VARIANTS ON CACHE BOOL "" FORCE)
+        endif()
+        # Everything is shipped flat next to llama_node.node: resolve the
+        # shared-lib deps relative to each binary, not the build tree.
+        if(APPLE)
+            set(CMAKE_INSTALL_RPATH "@loader_path")
+        else()
+            set(CMAKE_INSTALL_RPATH "$ORIGIN")
+        endif()
+        set(CMAKE_BUILD_WITH_INSTALL_RPATH ON)
+    else()
+        set(BUILD_SHARED_LIBS OFF CACHE BOOL "" FORCE)
+    endif()
+    if(LLAMA_NODE_VULKAN)
+        set(GGML_VULKAN ON CACHE BOOL "" FORCE)
+    endif()
     set(GGML_METAL_EMBED_LIBRARY ON CACHE BOOL "" FORCE)
     # Disable host-native CPU flags: cmake-js may cross-compile (e.g. x86_64
     # host → arm64 target via CMAKE_OSX_ARCHITECTURES), so -mcpu=native is
@@ -154,4 +206,49 @@ if(APPLE)
         "-framework Metal"
         "-framework MetalKit"
     )
+endif()
+
+# Backend-DL packaging: collect every vendor shared/MODULE library (llama,
+# ggml, ggml-base, llama-common when shared, and all dlopen'd backends —
+# whatever this llama.cpp version produces) and stage them next to
+# llama_node.node so the directory is self-contained. The addon loads
+# backends from its own directory at runtime (src/addon.cpp).
+if(LLAMA_NODE_VENDOR AND LLAMA_NODE_BACKEND_DL)
+    # Tells addon.cpp to load backends from the addon's directory instead of
+    # relying on statically registered ones.
+    target_compile_definitions(llama_node PRIVATE LLAMA_NODE_BACKEND_DL)
+
+    function(llama_node_collect_runtime_targets out_var dir)
+        set(result "")
+        get_property(dir_targets DIRECTORY "${dir}" PROPERTY BUILDSYSTEM_TARGETS)
+        foreach(tgt IN LISTS dir_targets)
+            get_target_property(tgt_type ${tgt} TYPE)
+            if(tgt_type STREQUAL "SHARED_LIBRARY" OR tgt_type STREQUAL "MODULE_LIBRARY")
+                list(APPEND result ${tgt})
+            endif()
+        endforeach()
+        get_property(subdirs DIRECTORY "${dir}" PROPERTY SUBDIRECTORIES)
+        foreach(sub IN LISTS subdirs)
+            llama_node_collect_runtime_targets(sub_result "${sub}")
+            list(APPEND result ${sub_result})
+        endforeach()
+        set(${out_var} ${result} PARENT_SCOPE)
+    endfunction()
+
+    llama_node_collect_runtime_targets(LLAMA_NODE_RUNTIME_TARGETS
+        "${CMAKE_SOURCE_DIR}/vendor/llama.cpp")
+
+    foreach(tgt IN LISTS LLAMA_NODE_RUNTIME_TARGETS)
+        # Strip VERSION/SOVERSION: npm packages cannot contain symlinks, so
+        # every library must be a single real file with its plain name
+        # (libggml-vulkan.so, not libggml-vulkan.so.0.9.5 + symlinks) — the
+        # ggml backend scan also only matches the plain ".so" extension.
+        set_property(TARGET ${tgt} PROPERTY VERSION)
+        set_property(TARGET ${tgt} PROPERTY SOVERSION)
+        add_custom_command(TARGET llama_node POST_BUILD
+            COMMAND ${CMAKE_COMMAND} -E copy_if_different
+                    "$<TARGET_FILE:${tgt}>" "$<TARGET_FILE_DIR:llama_node>")
+    endforeach()
+    list(LENGTH LLAMA_NODE_RUNTIME_TARGETS _n)
+    message(STATUS "llama-node: backend-DL mode, staging ${_n} runtime libs next to the addon: ${LLAMA_NODE_RUNTIME_TARGETS}")
 endif()

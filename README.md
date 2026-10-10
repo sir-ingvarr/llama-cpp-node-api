@@ -29,6 +29,33 @@ npm install
 
 The `vendor/llama.cpp` submodule is built automatically. On macOS, Metal acceleration is enabled by default. No extra flags needed.
 
+### Prebuilt platforms & GPU acceleration
+
+Installing from npm uses a prebuilt binary when one exists for your platform:
+
+| Package | GPU |
+| --- | --- |
+| `darwin-arm64`, `darwin-x64` | Metal (built in) |
+| `linux-x64`, `linux-arm64` | Vulkan — NVIDIA / AMD / Intel via the system Vulkan loader |
+| `win32-x64` | Vulkan — NVIDIA / AMD / Intel via the system Vulkan loader |
+
+The Linux and Windows prebuilds ship ggml backends as runtime-loadable
+libraries: the best CPU variant for your machine (SSE4.2 → AVX-512 / AMX on
+x86-64, armv8/armv9 on ARM) is picked automatically, and the Vulkan backend
+is used when a Vulkan loader + driver are present (`vulkan-1.dll` ships with
+GPU drivers on Windows; on Linux install your distro's `libvulkan1`/`vulkan-loader`
+package). Machines without Vulkan silently fall back to CPU — nothing to
+configure, nothing extra to install. `GGML_BACKEND_PATH` can point at an
+out-of-tree backend library to load additionally.
+
+Electron note: the platform package must stay together on disk —
+electron-builder's automatic native-module unpacking handles this; if you
+configure `asarUnpack` manually, unpack the whole
+`node_modules/@llama-cpp-node-api/**` directory, not just the `.node` file.
+
+CUDA is not prebuilt (it would add hundreds of MB per install for one GPU
+vendor); build from source with `npm run build:cuda` if you want it.
+
 ## Usage
 
 ```js
@@ -202,6 +229,21 @@ Frees model weights and KV cache. Idempotent — safe to call more than once. An
 
 Number of token slots in the current context window. `0` before the first `generate()` call.
 
+### `model.memoryUsage()`
+
+Current memory footprint of the instance. Synchronous and non-blocking — safe to poll from a UI while a generation is running.
+
+```js
+const { modelBytes, nParams, stateBytes } = model.memoryUsage();
+// modelBytes — total bytes of the loaded weight tensors (post-quantization)
+// nParams    — parameter count
+// stateBytes — context state size (KV cache + RNG + logits), or null
+```
+
+`stateBytes` is `null` when no context exists yet (nothing generated) **or** while a generation / embed currently holds the context — it never blocks waiting for one. Poll again after the call finishes.
+
+Note on `modelBytes`: under the default mmap load mode this is the logical tensor size; the OS may keep fewer pages resident, and they are evictable under memory pressure. It is the weight footprint, not a process-RSS measurement.
+
 ### `model.embed(text)` → `Promise<Float32Array>`
 
 Computes a vector embedding for `text`. Requires the model to have been opened with `{ embeddings: true }`; throws otherwise.
@@ -304,11 +346,24 @@ Returns `Promise<GgufInspectResult>`. Runs on a libuv worker thread.
 ## Build variants
 
 ```bash
-npm run build          # default (Metal on macOS)
+npm run build          # default (Metal on macOS, static CPU elsewhere)
 npm run build:cpu      # disable Metal
 npm run build:cuda     # enable CUDA
 npm run build:debug    # debug symbols
 ```
+
+The configuration the Linux/Windows prebuilds ship with (runtime-loadable
+CPU-variant backends + Vulkan) is enabled with environment variables
+(cmake-js does not reliably forward `-D` flags):
+
+```bash
+# Vulkan SDK (glslc + headers) required at build time only
+LLAMA_NODE_BACKEND_DL=1 LLAMA_NODE_VULKAN=1 npm run rebuild
+```
+
+`LLAMA_NODE_BACKEND_DL=1` places the shared `llama`/`ggml` libraries and the
+backend modules next to `llama_node.node` in `build/Release/` — keep them
+together if you relocate the addon.
 
 ## License
 

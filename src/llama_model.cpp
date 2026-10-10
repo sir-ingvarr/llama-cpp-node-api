@@ -36,6 +36,7 @@ Napi::Object LlamaModel::Init(Napi::Env env, Napi::Object exports) {
         InstanceMethod("tokenize", &LlamaModel::Tokenize),
         InstanceMethod("detokenize", &LlamaModel::Detokenize),
         InstanceMethod("getModelInfo", &LlamaModel::GetModelInfo),
+        InstanceMethod("memoryUsage", &LlamaModel::MemoryUsage),
         InstanceMethod("embed", &LlamaModel::Embed),
         InstanceMethod("saveState", &LlamaModel::SaveState),
         InstanceMethod("loadState", &LlamaModel::LoadState),
@@ -184,6 +185,10 @@ LlamaModel::~LlamaModel() {
     if (chat_templates_) {
         common_chat_templates_free(chat_templates_);
         chat_templates_ = nullptr;
+    }
+    if (parser_cache_) {
+        FreeParserCache(parser_cache_);
+        parser_cache_ = nullptr;
     }
 }
 
@@ -582,6 +587,10 @@ void LlamaModel::Dispose(const Napi::CallbackInfo & /*info*/) {
         common_chat_templates_free(chat_templates_);
         chat_templates_ = nullptr;
     }
+    if (parser_cache_) {
+        FreeParserCache(parser_cache_);
+        parser_cache_ = nullptr;
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -848,6 +857,44 @@ Napi::Value LlamaModel::GetModelInfo(const Napi::CallbackInfo & info) {
         }
         obj.Set("suppressTokens", arr);
     }
+
+    return obj;
+}
+
+// ---------------------------------------------------------------------------
+// memoryUsage()
+// ---------------------------------------------------------------------------
+
+Napi::Value LlamaModel::MemoryUsage(const Napi::CallbackInfo & info) {
+    Napi::Env env = info.Env();
+
+    if (!model_) {
+        Napi::Error::New(env, "LlamaModel has been disposed")
+            .ThrowAsJavaScriptException();
+        return env.Undefined();
+    }
+
+    Napi::Object obj = Napi::Object::New(env);
+
+    // Weight footprint: total bytes of all model tensors as loaded
+    // (post-quantization). Under mmap this is the logical size — the OS may
+    // not have every page resident.
+    obj.Set("modelBytes", Napi::Number::New(env, (double) llama_model_size(model_)));
+    obj.Set("nParams",    Napi::Number::New(env, (double) llama_model_n_params(model_)));
+
+    // Context state size (KV cache + RNG + logits/embeddings), the same
+    // quantity saveState() would serialize. Reading it needs ctx_mutex_, and
+    // the JS main thread must never *block* on that mutex (it would stall the
+    // event loop behind an in-flight decode) — so try_lock and report null
+    // when a worker currently owns the context, or when no context exists yet.
+    Napi::Value state_bytes = env.Null();
+    if (ctx_mutex_.try_lock()) {
+        if (ctx_) {
+            state_bytes = Napi::Number::New(env, (double) llama_state_get_size(ctx_));
+        }
+        ctx_mutex_.unlock();
+    }
+    obj.Set("stateBytes", state_bytes);
 
     return obj;
 }

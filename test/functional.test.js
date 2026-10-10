@@ -84,6 +84,21 @@ describeModel('LlamaModel functional', () => {
             assert.ok(Array.isArray(info.suppressTokens));
         });
 
+        it('memoryUsage() reports weights, and context state after a generate', async () => {
+            const before = model.memoryUsage();
+            assert.ok(before.modelBytes > 0);
+            assert.ok(before.nParams > 0);
+            assert.equal(before.modelBytes, model.getModelInfo().modelSize);
+            assert.equal(before.nParams, model.getModelInfo().nParams);
+            // Context may or may not exist yet depending on test order.
+            assert.ok(before.stateBytes === null || before.stateBytes > 0);
+
+            await collect(gen('Hi', { nPredict: 2 }));
+            // No decode in flight now, so the context is observable.
+            const after = model.memoryUsage();
+            assert.ok(after.stateBytes > 0, `expected stateBytes > 0, got ${after.stateBytes}`);
+        });
+
         it('chatTemplate is a string or null', () => {
             const t = model.chatTemplate;
             assert.ok(t === null || typeof t === 'string');
@@ -464,6 +479,7 @@ describeModel('LlamaModel functional', () => {
             scratch.dispose(); // idempotent
             assert.throws(() => scratch.tokenize('x'), /has been disposed/);
             assert.throws(() => scratch.getModelInfo(), /has been disposed/);
+            assert.throws(() => scratch.memoryUsage(), /has been disposed/);
             await assert.rejects(collect(scratch.generate('x')), /has been disposed/);
         });
     });

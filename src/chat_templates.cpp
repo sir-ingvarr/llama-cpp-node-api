@@ -32,6 +32,64 @@
 
 
 // ---------------------------------------------------------------------------
+// Parser cache
+// ---------------------------------------------------------------------------
+//
+// Upstream's chat refactor (#30210) removed common_peg_arena::save()/load(),
+// so the parser can no longer round-trip the JS boundary as a serialized
+// blob. Instead, the arena stays alive here and JS gets an opaque handle
+// string ("llama-node-parser:<id>"). The JS contract is unchanged (opaque
+// string in, opaque string out), but handles are only valid on the instance
+// that produced them, while it is alive, for the last PARSER_CACHE_MAX
+// applies. chat() uses apply → generate → parse on one instance, well within
+// that. Only touched on the JS main thread — no locking needed.
+
+static constexpr size_t PARSER_CACHE_MAX = 16;
+static const char       PARSER_HANDLE_PREFIX[] = "llama-node-parser:";
+
+struct ParserCache {
+    // Insertion-ordered by id (monotonic counter), so begin() is the oldest.
+    std::map<uint64_t, common_peg_arena> arenas;
+    uint64_t next_id = 1;
+};
+
+void FreeParserCache(ParserCache * cache) {
+    delete cache;
+}
+
+static std::string store_parser(ParserCache & cache, common_peg_arena && arena) {
+    const uint64_t id = cache.next_id++;
+    cache.arenas.emplace(id, std::move(arena));
+    while (cache.arenas.size() > PARSER_CACHE_MAX) {
+        cache.arenas.erase(cache.arenas.begin());
+    }
+    return std::string(PARSER_HANDLE_PREFIX) + std::to_string(id);
+}
+
+// Returns nullptr when the handle is unknown (evicted, or from another
+// instance); sets malformed=true when the string is not a handle at all.
+static const common_peg_arena * find_parser(
+    const ParserCache * cache, const std::string & handle, bool & malformed)
+{
+    malformed = false;
+    const size_t prefix_len = sizeof(PARSER_HANDLE_PREFIX) - 1;
+    if (handle.compare(0, prefix_len, PARSER_HANDLE_PREFIX) != 0) {
+        malformed = true;
+        return nullptr;
+    }
+    uint64_t id = 0;
+    try {
+        id = std::stoull(handle.substr(prefix_len));
+    } catch (const std::exception &) {
+        malformed = true;
+        return nullptr;
+    }
+    if (!cache) return nullptr;
+    auto it = cache->arenas.find(id);
+    return it == cache->arenas.end() ? nullptr : &it->second;
+}
+
+// ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
 
@@ -156,7 +214,7 @@ static common_chat_format parse_format_name(const std::string & name) {
 //
 // Returns:
 //   { prompt, format,
-//     parser?,                          -- serialised PEG arena (opaque blob)
+//     parser?,                          -- opaque handle to a cached PEG arena
 //     grammar?, grammarLazy?,
 //     grammarTriggerPatterns?, grammarTriggerTokens?,
 //     preservedTokens?, additionalStops? }
@@ -324,7 +382,9 @@ Napi::Value LlamaModel::ApplyChatTemplateJinja(const Napi::CallbackInfo & info) 
     result.Set("prompt", Napi::String::New(env, params.prompt));
     result.Set("format", Napi::String::New(env, common_chat_format_name(params.format)));
     if (!params.parser.empty()) {
-        result.Set("parser", Napi::String::New(env, params.parser));
+        if (!parser_cache_) parser_cache_ = new ParserCache();
+        result.Set("parser", Napi::String::New(env,
+            store_parser(*parser_cache_, std::move(params.parser))));
     }
     if (!params.generation_prompt.empty()) {
         result.Set("generationPrompt", Napi::String::New(env, params.generation_prompt));
@@ -389,7 +449,7 @@ Napi::Value LlamaModel::ApplyChatTemplateJinja(const Napi::CallbackInfo & info) 
 // parseChatResponse(text, { format, parser?, generationPrompt?, isPartial? })
 // ---------------------------------------------------------------------------
 //
-// Round-trips the opaque `parser` blob from applyChatTemplateJinja() and
+// Resolves the opaque `parser` handle from applyChatTemplateJinja() and
 // returns { content, reasoningContent, toolCalls: [{name, arguments, id}] }.
 // Works for all formats emitted by libcommon; the legacy fallback path
 // (format === "legacy") can't be parsed this way, so we return content-only.
@@ -432,35 +492,50 @@ Napi::Value LlamaModel::ParseChatResponse(const Napi::CallbackInfo & info) {
     }
 
     if (opts.Has("generationPrompt") && opts.Get("generationPrompt").IsString()) {
-        pparams.generation_prompt = opts.Get("generationPrompt").As<Napi::String>().Utf8Value();
+        // common_chat_input's text-only form (tokens unknown) — the parser
+        // only needs the text to strip/continue the assistant prefill.
+        pparams.generation_prompt = common_chat_input(
+            opts.Get("generationPrompt").As<Napi::String>().Utf8Value());
     }
-    if (opts.Has("parseToolCalls") && opts.Get("parseToolCalls").IsBoolean()) {
-        pparams.parse_tool_calls = opts.Get("parseToolCalls").As<Napi::Boolean>().Value();
-    }
+    // `parseToolCalls` was dropped upstream in the chat refactor (#30210) —
+    // tool calls are now always parsed when the format has them. The option
+    // is accepted and ignored for backward compatibility.
     bool is_partial = false;
     if (opts.Has("isPartial") && opts.Get("isPartial").IsBoolean()) {
         is_partial = opts.Get("isPartial").As<Napi::Boolean>().Value();
     }
 
-    // Deserialise the PEG arena from the opaque blob produced by apply().
+    // Resolve the opaque parser handle produced by applyChatTemplateJinja().
     // Empty string → libcommon falls back to a pure-content parser.
     if (opts.Has("parser") && opts.Get("parser").IsString()) {
-        const std::string parser_blob = opts.Get("parser").As<Napi::String>().Utf8Value();
-        if (!parser_blob.empty()) {
-            try {
-                pparams.parser.load(parser_blob);
-            } catch (const std::exception & e) {
+        const std::string handle = opts.Get("parser").As<Napi::String>().Utf8Value();
+        if (!handle.empty()) {
+            bool malformed = false;
+            const common_peg_arena * arena = find_parser(parser_cache_, handle, malformed);
+            if (malformed) {
                 Napi::Error::New(env,
-                    std::string("parser blob deserialisation failed: ") + e.what())
+                    "parseChatResponse: `parser` is not a handle from this "
+                    "version's applyChatTemplateJinja(). Serialized parser "
+                    "blobs from earlier versions are no longer supported — "
+                    "re-run applyChatTemplateJinja().")
                     .ThrowAsJavaScriptException();
                 return env.Undefined();
             }
+            if (!arena) {
+                Napi::Error::New(env,
+                    "parseChatResponse: parser handle has expired or belongs "
+                    "to another model instance — re-run applyChatTemplateJinja() "
+                    "on this instance.")
+                    .ThrowAsJavaScriptException();
+                return env.Undefined();
+            }
+            pparams.parser = *arena;
         }
     }
 
     common_chat_msg msg;
     try {
-        msg = common_chat_parse(text, is_partial, pparams);
+        msg = common_chat_parse(common_chat_input(text), is_partial, pparams);
     } catch (const std::exception & e) {
         Napi::Error::New(env, std::string("common_chat_parse failed: ") + e.what())
             .ThrowAsJavaScriptException();

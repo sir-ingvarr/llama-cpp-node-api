@@ -18,6 +18,10 @@ vendor/llama.cpp/build/
 # Prebuilt binaries (consumers compile from source)
 *.node
 
+# Shared libs staged into the platform packages by CI (backend-DL prebuilds)
+npm/**/*.so
+npm/**/*.dll
+
 .cache
 
 # Local planning notes

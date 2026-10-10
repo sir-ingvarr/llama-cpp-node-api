@@ -32,7 +32,34 @@ npm run rebuild    # clean rebuild
 npm run build:debug    # debug symbols
 npm run build:cuda     # enable CUDA
 npm run build:cpu      # disable Metal (CPU-only)
+
+# Backend-DL + Vulkan — the configuration the linux/win prebuilds ship with
+# (env vars, not -D flags: cmake-js doesn't forward them reliably).
+# Vulkan needs the Vulkan SDK (glslc + headers) at BUILD time only.
+LLAMA_NODE_BACKEND_DL=1 LLAMA_NODE_VULKAN=1 npm run rebuild
 ```
+
+### Backend-DL mode (`LLAMA_NODE_BACKEND_DL`)
+
+Vendor-mode only. Sets `BUILD_SHARED_LIBS=ON` + `GGML_BACKEND_DL=ON` (+
+`GGML_CPU_ALL_VARIANTS=ON` off-Apple): `llama`/`ggml`/`ggml-base`/
+`llama-common` become shared libs and every ggml backend becomes a MODULE
+library dlopened at runtime. CMake enumerates all vendor shared/MODULE
+targets, strips their `VERSION`/`SOVERSION` (npm packages can't hold
+symlinks, and the ggml backend scan only matches the plain `.so`/`.dll`
+name), gives everything an `$ORIGIN`/`@loader_path` rpath, and copies the
+set into `build/Release/` next to the addon — the directory must stay
+together when relocated. `addon.cpp` (under the `LLAMA_NODE_BACKEND_DL`
+compile definition) resolves its own directory via `dladdr` /
+`GetModuleFileNameW` and calls `ggml_backend_load_all_from_path()` with it —
+the default ggml search (executable dir + cwd) would never find backends
+inside `node_modules`. The CPU variant with the best score for the machine
+wins; GPU backends (Vulkan) are skipped gracefully when their system
+libraries are missing, so GPU-less CI runners and headless servers fall
+back to CPU instead of failing to `require()`. The linux-x64, linux-arm64
+and win32-x64 prebuilds are built this way (see `prebuild.yml`: Vulkan SDK
+install, multi-file artifact staging); macOS prebuilds stay static with
+embedded Metal.
 
 ### Building against a pre-built sibling llama.cpp tree
 
@@ -113,7 +140,7 @@ Links against both `llama` and `llama-common` from the vendor tree. `LLAMA_BUILD
 
 - **`chat_templates.cpp`** — Jinja chat rendering + response parsing via libcommon. Exposes two `LlamaModel` methods:
   - `applyChatTemplateJinja(messages, opts)` → `{ prompt, format, parser?, grammar?, grammarLazy?, grammarTriggerPatterns?, grammarTriggerTokens?, preservedTokens?, additionalStops? }`. Auto-falls back to `llama_chat_apply_template` (legacy C API, resolves alias names like `mistral-v7-tekken`) when the embedded template isn't Jinja source; throws if `tools` / `jsonSchema` were supplied on that path (can't be honoured). `chatTemplateOverride` lets the caller supply full Jinja source when the embedded template is an alias.
-  - `parseChatResponse(text, { format, parser, ... })` → `{ content, reasoningContent, toolCalls[] }`. Round-trips the opaque `parser` blob (from `common_peg_arena::save()`) and dispatches to the right per-format parser. `format === 'legacy'` bypasses parsing and returns `text` as content.
+  - `parseChatResponse(text, { format, parser, ... })` → `{ content, reasoningContent, toolCalls[] }`. Round-trips the opaque `parser` handle (`"llama-node-parser:<id>"`) and dispatches to the right per-format parser. Upstream removed `common_peg_arena::save()/load()` (chat refactor #30210), so arenas no longer cross JS as blobs — they live in a per-model `ParserCache` (FIFO, 16 entries, JS-thread only, freed in dtor/`Dispose()` via `FreeParserCache`); an unknown/evicted handle throws. `format === 'legacy'` bypasses parsing and returns `text` as content.
   - The `common_chat_templates *` is lazily initialised on first use and cached on the `LlamaModel` instance; freed in `~LlamaModel` / `Dispose()`.
 
 - **Lazy grammar** — `GenerateWorker` branches on `grammarTriggerPatterns` / `grammarTriggerTokens`: if either is non-empty, uses `llama_sampler_init_grammar_lazy_patterns()` (grammar activates only after a trigger appears in the output); else uses eager `llama_sampler_init_grammar()`. Backward-compatible: existing callers passing only `grammar` see no behavioural change. Trigger conversion from libcommon's typed `common_grammar_trigger` mirrors `common/sampling.cpp` (regex_escape words, anchor PATTERN_FULL patterns, TOKEN triggers go to the separate token-array argument).

@@ -58,6 +58,7 @@
         "@llama-cpp-node-api/darwin-arm64": "0.15.0",
         "@llama-cpp-node-api/darwin-x64": "0.15.0",
         "@llama-cpp-node-api/linux-x64": "0.15.0",
+        "@llama-cpp-node-api/linux-arm64": "0.15.0",
         "@llama-cpp-node-api/win32-x64": "0.15.0"
     }
 }

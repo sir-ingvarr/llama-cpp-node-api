@@ -10,7 +10,8 @@
     ],
     "main": "llama_node.node",
     "files": [
-        "llama_node.node"
+        "llama_node.node",
+        "*.dll"
     ],
     "license": "MIT",
     "repository": {

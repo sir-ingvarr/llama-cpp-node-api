@@ -7,6 +7,7 @@ const PLATFORMS = {
     'darwin-arm64': '@llama-cpp-node-api/darwin-arm64',
     'darwin-x64':   '@llama-cpp-node-api/darwin-x64',
     'linux-x64':    '@llama-cpp-node-api/linux-x64',
+    'linux-arm64':  '@llama-cpp-node-api/linux-arm64',
     'win32-x64':    '@llama-cpp-node-api/win32-x64',
 };
 
@@ -27,7 +28,7 @@ function loadAddon() {
     const tried = errors.length ? '\nTried:\n' + errors.join('\n') : '';
     throw new Error(
         `llama-cpp-node-api: no working binary for ${key}.${tried}\n` +
-        'Supported platforms: darwin-arm64, darwin-x64, linux-x64, win32-x64.\n' +
+        'Supported platforms: darwin-arm64, darwin-x64, linux-x64, linux-arm64, win32-x64.\n' +
         'To build from source, install from git instead:\n' +
         '  npm install git+https://github.com/sir-ingvarr/llama-cpp-node-api.git'
     );
@@ -581,6 +582,27 @@ class LlamaModel {
     getModelInfo() {
         this.#assertLive();
         return this.#native.getModelInfo();
+    }
+
+    /**
+     * Current memory footprint of this model instance.
+     *
+     * - `modelBytes` — total bytes of all model tensors as loaded
+     *   (post-quantization). Under mmap (the default) this is the logical
+     *   size; the OS may keep fewer pages resident.
+     * - `nParams` — total parameter count.
+     * - `stateBytes` — context state size (KV cache + RNG + logits), i.e.
+     *   what `saveState()` would write. `null` when no context exists yet
+     *   (nothing generated) or while a generation/embed currently holds the
+     *   context — poll again after it finishes.
+     *
+     * Synchronous and non-blocking: never waits on an in-flight decode.
+     *
+     * @returns {import('./index').MemoryUsage}
+     */
+    memoryUsage() {
+        this.#assertLive();
+        return this.#native.memoryUsage();
     }
 
     /**

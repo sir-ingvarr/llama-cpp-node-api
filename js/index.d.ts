@@ -511,6 +511,23 @@ export interface ModelInfo {
     suppressTokens: number[];
 }
 
+export interface MemoryUsage {
+    /**
+     * Total bytes of all model tensors as loaded (post-quantization).
+     * Under mmap (the default load mode) this is the logical size; the OS
+     * may keep fewer pages resident.
+     */
+    modelBytes: number;
+    /** Total number of parameters. */
+    nParams: number;
+    /**
+     * Context state size in bytes (KV cache + RNG + logits) — what
+     * `saveState()` would write. `null` when no context exists yet, or
+     * while a generation/embed currently holds the context.
+     */
+    stateBytes: number | null;
+}
+
 /**
  * Names accepted by `QuantizeOptions.ftype`. Mirrors llama.cpp's CLI
  * ftype names (the `LLAMA_FTYPE_MOSTLY_` prefix stripped).
@@ -603,6 +620,13 @@ export declare class LlamaModel {
     detokenize(tokens: number[], opts?: DetokenizeOptions): string;
     /** Returns model metadata: description, parameter count, sizes, special tokens. */
     getModelInfo(): ModelInfo;
+    /**
+     * Current memory footprint: model weight bytes, parameter count, and
+     * live context state size. Synchronous and non-blocking — never waits
+     * on an in-flight decode (`stateBytes` is `null` while one is running
+     * or before the first generation creates a context).
+     */
+    memoryUsage(): MemoryUsage;
     /**
      * Compute an embedding for `text`. Requires the model to have been
      * constructed with `{ embeddings: true }`; throws otherwise. The returned

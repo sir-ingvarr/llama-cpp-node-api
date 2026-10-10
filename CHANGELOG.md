@@ -7,6 +7,57 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 Changelog entries start at the llama.cpp v0.6.0 upgrade (2026-10-09); earlier
 history lives in the git log.
 
+## [Unreleased]
+
+### Changed
+
+- llama.cpp submodule updated to b11541 (`f2918ca`). Highlights inherited
+  from upstream: Metal flash-attention kernels for more head-size pairs,
+  few-row MMA matrix-vector kernels for most quant types, MoE expert
+  caching (`moe_cache_size`, not yet exposed here), and the chat-parser
+  refactor below.
+- **Breaking:** saved session states from earlier releases no longer load.
+  `saveState()` files are bound to the llama.cpp version that wrote them
+  (as documented since 0.15.0), so this submodule bump invalidates existing
+  snapshots — `loadState()` rejects them and the conversation must be
+  re-processed (or re-saved) once. No code change is needed.
+- **Breaking (edge case):** `applyChatTemplateJinja().parser` is now a
+  compact handle string (`llama-node-parser:<id>`) instead of a serialized
+  parser blob — upstream
+  removed `common_peg_arena::save()/load()`. The contract is unchanged
+  (treat it as an opaque string and round-trip it into
+  `parseChatResponse`), but a handle is only valid on the model instance
+  that produced it, while that instance is alive, for the 16 most recent
+  `applyChatTemplateJinja` calls on it. Persisting the handle across
+  processes or model reloads — which previously happened to work — no
+  longer does; re-render the template to get a fresh one.
+
+### Added
+
+- **Vulkan GPU support in the Linux and Windows prebuilds.** The
+  `linux-x64`, `linux-arm64` (new) and `win32-x64` platform packages are now
+  built with `GGML_BACKEND_DL`: ggml backends ship as runtime-loadable
+  libraries next to the addon instead of one statically linked CPU backend.
+  At runtime the best CPU variant for the machine is picked by score
+  (SSE4.2 → AVX-512/AMX on x86-64, armv8/armv9 on ARM — previously the
+  prebuilds were capped at a fixed baseline), and the Vulkan backend
+  (NVIDIA / AMD / Intel through the system Vulkan loader) is used when a
+  loader + driver are present, falling back to CPU silently otherwise.
+  Nothing to configure; `GGML_BACKEND_PATH` is honoured for out-of-tree
+  backends. macOS prebuilds are unchanged (static, embedded Metal).
+- **`linux-arm64` prebuilt platform package** — Graviton/Ampere servers and
+  Docker on Apple Silicon no longer need a source build.
+- **`LLAMA_NODE_BACKEND_DL=1` / `LLAMA_NODE_VULKAN=1`** environment
+  variables for source builds (same mechanism as `LLAMA_ROOT`): enable the
+  backend-DL layout and the ggml Vulkan backend respectively. Vulkan needs
+  the Vulkan SDK (glslc + headers) at build time only.
+- **`model.memoryUsage()`** — synchronous, non-blocking memory report:
+  `{ modelBytes, nParams, stateBytes }`. `modelBytes` is the loaded weight
+  footprint (`llama_model_size`), `stateBytes` the live context state size
+  (`llama_state_get_size`: KV cache + RNG + logits). `stateBytes` is `null`
+  before the first generation or while a decode holds the context — the JS
+  thread only ever `try_lock`s `ctx_mutex_`, never blocks on it.
+
 ## [0.15.0] - 2026-10-09
 
 ### Added

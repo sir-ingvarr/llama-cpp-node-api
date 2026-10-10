@@ -1,7 +1,9 @@
 # Per-push build status (the README "Build" badge). Compiles the addon on
-# one cheap platform and hands the binary to the Tests workflow, which runs
-# on its completion — so the native module is only compiled once per push.
-# The full four-platform matrix still runs in prebuild.yml before a release.
+# one cheap platform — in the same backend-DL + Vulkan configuration the
+# linux prebuilds ship with — and hands the binaries to the Tests workflow,
+# which runs on its completion, so the native module is only compiled once
+# per push. The full five-platform matrix still runs in prebuild.yml before
+# a release.
 name: Build
 
 on:
@@ -30,10 +32,23 @@ jobs:
       - name: Install dependencies (skip native build)
         run: npm install --ignore-scripts
 
+      # Build-time Vulkan deps only (glslc + headers); the resulting backend
+      # module falls back to CPU at runtime on machines without a Vulkan
+      # loader — which includes the Tests workflow runner.
+      - name: Install Vulkan build dependencies
+        run: |
+          sudo apt-get update -y
+          sudo apt-get install -y gcc-14 g++-14 glslc libvulkan-dev spirv-headers
+          echo "CC=gcc-14" >> "$GITHUB_ENV"
+          echo "CXX=g++-14" >> "$GITHUB_ENV"
+
       - name: Build native module
+        env:
+          LLAMA_NODE_BACKEND_DL: 1
+          LLAMA_NODE_VULKAN: 1
         run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
 
-      - name: Stage binary for the Tests workflow
+      - name: Stage binaries for the Tests workflow
         run: |
           set -euo pipefail
           NODE_FILE=$(find build -name "llama_node.node" -type f | head -1)
@@ -41,12 +56,18 @@ jobs:
             echo "::error::Could not find llama_node.node"
             exit 1
           fi
+          OUT_DIR=$(dirname "$NODE_FILE")
           mkdir -p artifact
           cp "$NODE_FILE" artifact/llama_node.node
+          find "$OUT_DIR" -maxdepth 1 -type f -name '*.so' -exec cp {} artifact/ \;
+          if ! ls artifact/libggml-* >/dev/null 2>&1; then
+            echo "::error::backend-DL build produced no backend libraries"
+            exit 1
+          fi
 
       - uses: actions/upload-artifact@v7
         with:
           name: ci-binary
-          path: artifact/llama_node.node
+          path: artifact/
           if-no-files-found: error
           retention-days: 1

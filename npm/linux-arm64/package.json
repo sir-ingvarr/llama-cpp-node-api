@@ -1,0 +1,21 @@
+{
+    "name": "@llama-cpp-node-api/linux-arm64",
+    "version": "0.15.0",
+    "description": "llama-cpp-node-api native binary for Linux ARM64",
+    "os": [
+        "linux"
+    ],
+    "cpu": [
+        "arm64"
+    ],
+    "main": "llama_node.node",
+    "files": [
+        "llama_node.node",
+        "*.so"
+    ],
+    "license": "MIT",
+    "repository": {
+        "type": "git",
+        "url": "git+https://github.com/sir-ingvarr/llama-cpp-node-api.git"
+    }
+}

@@ -17,6 +17,15 @@
 // via common_chat_templates_free() from the .cpp.
 struct common_chat_templates;
 
+// Per-model cache of live PEG parser arenas (defined in chat_templates.cpp).
+// Upstream removed common_peg_arena::save()/load() in the chat API refactor
+// (#30210), so the parser can no longer cross the JS boundary as a blob —
+// applyChatTemplateJinja now stores the arena here and returns an opaque
+// handle string that parseChatResponse resolves back. Only ever touched on
+// the JS main thread.
+struct ParserCache;
+void FreeParserCache(ParserCache * cache);
+
 // Per-env shared state (worker counter, shutdown flag). Defined in
 // addon_state.h; held by reference here, owned by env.SetInstanceData.
 struct AddonState;
@@ -83,6 +92,7 @@ private:
     Napi::Value Tokenize(const Napi::CallbackInfo & info);
     Napi::Value Detokenize(const Napi::CallbackInfo & info);
     Napi::Value GetModelInfo(const Napi::CallbackInfo & info);
+    Napi::Value MemoryUsage(const Napi::CallbackInfo & info);
     Napi::Value Embed(const Napi::CallbackInfo & info);
     // Session-state persistence (llama_state_save_file / _load_file), run on
     // a libuv worker serialized on ctx_mutex_. Implemented in state_worker.cpp.
@@ -131,6 +141,10 @@ private:
     // Lazily initialised on first ApplyChatTemplateJinja call and reused for
     // the lifetime of the model. Freed in Dispose() / dtor.
     common_chat_templates * chat_templates_ = nullptr;
+
+    // Live PEG arenas referenced by the opaque parser handles handed to JS.
+    // Lazily allocated by ApplyChatTemplateJinja; freed in Dispose() / dtor.
+    ParserCache * parser_cache_ = nullptr;
 
     bool disposed_ = false;
 };
