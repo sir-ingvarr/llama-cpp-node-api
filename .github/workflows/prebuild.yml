@@ -227,17 +227,31 @@ jobs:
       - name: Extract release notes from CHANGELOG.md
         run: node scripts/extract-changelog.js "$PACKAGE_VERSION" > release_notes.md
 
+      # Skip versions that are already on the registry so a re-run of a
+      # partially failed release resumes where it stopped instead of dying
+      # on the first "cannot publish over previously published version".
       - name: Publish platform packages
         shell: bash
         run: |
           set -euo pipefail
           for triple in darwin-arm64 darwin-x64 linux-x64 linux-arm64 win32-x64; do
+            if npm view "@llama-cpp-node-api/${triple}@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+              echo "@llama-cpp-node-api/${triple}@${PACKAGE_VERSION} already published — skipping"
+              continue
+            fi
             echo "Publishing @llama-cpp-node-api/${triple}"
             ( cd "npm/${triple}" && npm publish --access public --provenance )
           done
 
       - name: Publish meta package
-        run: npm publish --access public --provenance
+        shell: bash
+        run: |
+          set -euo pipefail
+          if npm view "llama-cpp-node-api@${PACKAGE_VERSION}" version >/dev/null 2>&1; then
+            echo "llama-cpp-node-api@${PACKAGE_VERSION} already published — skipping"
+          else
+            npm publish --access public --provenance
+          fi
 
       - name: Create GitHub release
         uses: softprops/action-gh-release@v3
