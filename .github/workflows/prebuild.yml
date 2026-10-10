@@ -94,12 +94,31 @@ jobs:
           Add-Content $env:GITHUB_PATH "C:\VulkanSDK\$env:VULKAN_VERSION\bin"
 
       - name: Build native module
+        if: matrix.platform != 'win32'
         env:
           # Read by CMakeLists.txt (cmake-js does not reliably forward -D
           # vars); empty means off.
           LLAMA_NODE_BACKEND_DL: ${{ matrix.backends == 'dl-vulkan' && '1' || '' }}
           LLAMA_NODE_VULKAN: ${{ matrix.backends == 'dl-vulkan' && '1' || '' }}
         run: npx cmake-js compile --release -r node -v $(node -v | tr -d v)
+
+      # Windows builds in a short directory: MSBuild's FileTracker fails with
+      # FTK1011 once the vulkan-shaders-gen ExternalProject's try-compile
+      # scratch paths exceed MAX_PATH (260 chars, not lifted by the long-path
+      # registry key) — the default D:\a\<repo>\<repo>\build prefix alone eats
+      # most of the budget. Build under RUNNER_TEMP and copy the result back
+      # to build/Release, where the loader, unit tests and staging expect it.
+      - name: Build native module (Windows, short build dir)
+        if: matrix.platform == 'win32'
+        shell: bash
+        env:
+          LLAMA_NODE_BACKEND_DL: ${{ matrix.backends == 'dl-vulkan' && '1' || '' }}
+          LLAMA_NODE_VULKAN: ${{ matrix.backends == 'dl-vulkan' && '1' || '' }}
+        run: |
+          OUT="${RUNNER_TEMP//\\//}/b"
+          npx cmake-js compile --release -r node -v $(node -v | tr -d v) --out "$OUT"
+          mkdir -p build
+          cp -R "$OUT/Release" build/Release
 
       # The loader prefers the published platform packages from
       # optionalDependencies; drop them so the tests exercise the binary
